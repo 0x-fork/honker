@@ -1049,6 +1049,21 @@ pub fn retry(
     delay_s: i64,
     error: &str,
 ) -> rusqlite::Result<i64> {
+    // The ownership read must share the transaction with the mutation. Otherwise
+    // another connection can cancel/reclaim between them, and a cached snapshot
+    // can overwrite the new claim or resurrect a cancelled job in the dead queue.
+    in_savepoint(conn, "honker_retry", || {
+        retry_inner(conn, job_id, worker_id, delay_s, error)
+    })
+}
+
+fn retry_inner(
+    conn: &Connection,
+    job_id: i64,
+    worker_id: &str,
+    delay_s: i64,
+    error: &str,
+) -> rusqlite::Result<i64> {
     #[allow(clippy::type_complexity)]
     let row: Option<(i64, String, String, i64, i64, i64, i64, i64)> = conn
         .query_row(
@@ -1078,48 +1093,51 @@ pub fn retry(
         return Ok(0);
     };
     if attempts >= max_attempts {
-        // DELETE then INSERT as two statements: without a savepoint a
-        // failing INSERT leaves the job in neither table. Measured on
-        // this branch before the fix: live=0, dead=0.
-        in_savepoint(conn, "honker_retry_dead_letter", || {
-            conn.execute(
-                "DELETE FROM _honker_live WHERE id = ?1",
-                rusqlite::params![id],
-            )?;
-            conn.execute(
-                "INSERT INTO _honker_dead
-                   (id, queue, payload, priority, run_at, max_attempts,
-                    attempts, last_error, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![
-                    id,
-                    queue,
-                    payload,
-                    priority,
-                    run_at,
-                    max_attempts,
-                    attempts,
-                    error,
-                    created_at
-                ],
-            )?;
-            Ok(())
-        })?;
-    } else {
+        // Only an actually removed, still-owned row may become a dead row.
+        // Recheck the lease because time can advance after the ownership read.
+        let removed = conn.execute(
+            "DELETE FROM _honker_live
+             WHERE id = ?1 AND worker_id = ?2 AND state = 'processing'
+               AND claim_expires_at >= unixepoch()",
+            rusqlite::params![id, worker_id],
+        )?;
+        if removed == 0 {
+            return Ok(0);
+        }
         conn.execute(
+            "INSERT INTO _honker_dead
+               (id, queue, payload, priority, run_at, max_attempts,
+                attempts, last_error, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                id,
+                queue,
+                payload,
+                priority,
+                run_at,
+                max_attempts,
+                attempts,
+                error,
+                created_at
+            ],
+        )?;
+        Ok(1)
+    } else {
+        let updated = conn.execute(
             "UPDATE _honker_live
              SET state = 'pending',
                  run_at = unixepoch() + ?2,
                  worker_id = NULL,
                  claim_expires_at = NULL,
                  claimed_at = NULL
-             WHERE id = ?1",
-            rusqlite::params![id, delay_s],
+             WHERE id = ?1 AND worker_id = ?3 AND state = 'processing'
+               AND claim_expires_at >= unixepoch()",
+            rusqlite::params![id, delay_s, worker_id],
         )?;
         // Wake comes from the live-table UPDATE + commit (data_version).
         // No synthetic notification row — see enqueue() for rationale.
+        Ok(updated as i64)
     }
-    Ok(1)
 }
 
 /// Unconditionally move the claim to `_honker_dead` with the given

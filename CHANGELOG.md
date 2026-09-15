@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## Unreleased — retry claim ownership
+
+- Retry keeps its ownership read and mutation in one savepoint and rechecks the
+  lease on the final write. A concurrent cancel or reclaim cannot resurrect a
+  cancelled job or clear a newer worker's claim. A stale read snapshot returns
+  a database error; a claim that expires before the write returns a miss.
+- Dead-letter insertion requires a successful removal of the owned live row.
+
 ## Unreleased — `claimed_at` on `_honker_live`
 
 - New nullable `claimed_at INTEGER` column on `_honker_live`: when the
