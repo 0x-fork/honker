@@ -768,8 +768,10 @@ jobs:
           cp target/release/libhonker_ext.so "$RUNNER_TEMP/honker-current/"
           git fetch --no-tags --depth=1 origin "$LEGACY_COMMIT"
           git archive "$LEGACY_COMMIT" | tar -x -C "$RUNNER_TEMP/honker-legacy-source"
-          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --release --locked -p honker-extension --manifest-path "$RUNNER_TEMP/honker-legacy-source/Cargo.toml"
-          cp target/release/libhonker_ext.so "$RUNNER_TEMP/honker-legacy/"
+          # The archived sources have older mtimes and the same crate versions.
+          # A shared target can incorrectly reuse the current extension as legacy.
+          CARGO_TARGET_DIR="$RUNNER_TEMP/honker-legacy-target" cargo build --release --locked -p honker-extension --manifest-path "$RUNNER_TEMP/honker-legacy-source/Cargo.toml"
+          cp "$RUNNER_TEMP/honker-legacy-target/release/libhonker_ext.so" "$RUNNER_TEMP/honker-legacy/"
       - name: Prove supported cutover and mixed-version recovery
         run: |
           python3 scripts/proof/claimed-at-upgrade.py --legacy-extension "$RUNNER_TEMP/honker-legacy/libhonker_ext.so" --extension "$RUNNER_TEMP/honker-current/libhonker_ext.so"
