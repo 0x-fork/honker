@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## Unreleased — SQL call context for protected job transitions
+
+- Claim, fail, expiry sweep, and retry require a separate SELECT after finishing
+  write/RETURNING cursors. Trigger and write-statement invocation is unsupported.
+  Explicit caller transactions remain supported. The SQLite error now explains
+  this distinction instead of only saying that SQL statements are in progress.
+- Do not remove savepoint protection to restore old invocation patterns: it
+  prevents failed transitions from silently losing jobs.
+
 ## Unreleased — retry claim ownership
 
 - Retry keeps its ownership read and mutation in one savepoint and rechecks the

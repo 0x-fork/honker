@@ -182,6 +182,33 @@ The extension shares tables with the language bindings, so a Python
 worker can claim jobs written by SQL, Node, Ruby, Go, or any other
 binding.
 
+
+### SQL call context
+
+Call `honker_claim_batch`, `honker_fail`, `honker_sweep_expired`, and
+`honker_retry` through a **separate SELECT**, after finishing any write cursors
+on that connection. Do not put them inside a trigger, an INSERT/UPDATE/DELETE,
+or a RETURNING expression. An unfinished `INSERT ... RETURNING` cursor also
+blocks these calls, even when the call itself is a separate SELECT.
+
+These operations use savepoints to preserve jobs if part of the operation fails.
+SQLite cannot open a savepoint while a write statement is active. Increasing
+`busy_timeout` does not resolve this condition: consume or close the write cursor.
+An explicit application transaction is supported and keeps all work atomic:
+
+```sql
+BEGIN;
+UPDATE app_orders SET status = 'failed' WHERE id = 42;
+-- If using RETURNING above, finish its cursor before the next statement.
+SELECT honker_fail(7, 'worker-1', 'delivery rejected');
+COMMIT;
+```
+
+The application must roll back the transaction on an error. This restriction
+also applies to direct Rust calls while their connection has an active write
+statement. It is a compatibility change from versions before savepoint-protected
+job transitions; keep the operations separate instead of embedding them in DML.
+
 ### How long has this job been running
 
 `_honker_live.claimed_at` is when the CURRENT claim started. Nothing

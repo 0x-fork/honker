@@ -123,7 +123,28 @@ fn in_savepoint<T>(
     // True means this SAVEPOINT is what opens the transaction, so we
     // own it and nobody else's work is inside it.
     let owns_transaction = conn.is_autocommit();
-    conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+    conn.execute_batch(&format!("SAVEPOINT {name}"))
+        .map_err(|err| {
+            // SQLite cannot create a savepoint while a write statement is active.
+            // Retain its error code and rollback protection, but tell SQL/ORM callers
+            // how to finish their cursor and invoke the operation safely.
+            match err {
+                rusqlite::Error::SqliteFailure(code, Some(message))
+                    if code.code == rusqlite::ErrorCode::DatabaseBusy
+                        && message == "cannot open savepoint - SQL statements in progress" =>
+                {
+                    rusqlite::Error::SqliteFailure(
+                        code,
+                        Some(format!(
+                            "{message}; honker: {name} requires a separate SELECT after you \
+                     finish all write/RETURNING cursors; do not call it from a trigger \
+                     or write statement. An explicit surrounding transaction is supported"
+                        )),
+                    )
+                }
+                other => other,
+            }
+        })?;
     let mut guard = UnwindUndo {
         conn,
         name,
