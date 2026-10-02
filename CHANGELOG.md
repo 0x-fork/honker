@@ -2,10 +2,15 @@
 
 ## Unreleased — SQL call context for protected job transitions
 
-- Claim, fail, expiry sweep, and retry require a separate SELECT after finishing
-  write/RETURNING cursors. Trigger and write-statement invocation is unsupported.
-  Explicit caller transactions remain supported. The SQLite error now explains
-  this distinction instead of only saying that SQL statements are in progress.
+- `honker_claim_batch`, `honker_fail`, `honker_sweep_expired`, and a
+  `honker_retry` that dead-letters the job must run as a separate SELECT
+  after write/RETURNING cursors are finished. They are not supported inside
+  triggers or write statements. A `honker_retry` that returns the job to
+  pending has no savepoint and is not restricted.
+- The error now names the function the caller used and explains how to call
+  it, instead of only saying that SQL statements are in progress.
+- Explicit caller transactions remain supported; the docs recommend
+  `BEGIN IMMEDIATE`.
 - Do not remove savepoint protection to restore old invocation patterns: it
   prevents failed transitions from silently losing jobs.
 

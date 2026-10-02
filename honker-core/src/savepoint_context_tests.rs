@@ -1,7 +1,22 @@
 use crate::{attach_honker_functions, bootstrap_honker_schema, honker_ops};
 use rusqlite::{Connection, Error, types::Value};
 
-const OPERATIONS: [&str; 5] = ["claim", "fail", "sweep", "retry_pending", "retry_dead"];
+/// Operations that open a savepoint, so SQLite refuses them while a write
+/// statement is active. A retry that only puts the job back to pending is
+/// one UPDATE with no savepoint and is not restricted; see
+/// `pending_retry_works_in_write_contexts`.
+const RESTRICTED: [&str; 4] = ["claim", "fail", "sweep", "retry_dead"];
+const ALL: [&str; 5] = ["claim", "fail", "sweep", "retry_pending", "retry_dead"];
+
+/// The public SQL function each operation calls.
+fn public_name(op: &str) -> &'static str {
+    match op {
+        "claim" => "honker_claim_batch",
+        "fail" => "honker_fail",
+        "sweep" => "honker_sweep_expired",
+        _ => "honker_retry",
+    }
+}
 
 fn setup(op: &str) -> (Connection, String) {
     let c = Connection::open_in_memory().unwrap();
@@ -26,9 +41,13 @@ fn setup(op: &str) -> (Connection, String) {
     (c, call)
 }
 
-fn check_error(err: Error) {
+fn check_error(op: &str, err: Error) {
     let text = err.to_string();
-    assert!(text.contains("requires a separate SELECT"), "{text}");
+    let name = public_name(op);
+    assert!(
+        text.contains(&format!("honker: {name} requires a separate SELECT")),
+        "the error must name {name}: {text}"
+    );
     assert!(
         text.contains("finish all write/RETURNING cursors"),
         "{text}"
@@ -49,7 +68,7 @@ fn count(c: &Connection, table: &str) -> i64 {
 
 #[test]
 fn write_statement_and_trigger_calls_fail_without_changing_jobs() {
-    for op in OPERATIONS {
+    for op in RESTRICTED {
         for context in ["insert", "returning", "trigger"] {
             let (c, call) = setup(op);
             let before = live(&c);
@@ -67,7 +86,7 @@ fn write_statement_and_trigger_calls_fail_without_changing_jobs() {
             let err = c
                 .execute_batch(&sql)
                 .expect_err("write contexts must fail explicitly");
-            check_error(err);
+            check_error(op, err);
             assert_eq!(live(&c), before, "{op} in {context}");
             assert_eq!(count(&c, "_honker_dead"), 0);
             assert_eq!(count(&c, "app"), 0, "outer write must fail too");
@@ -78,7 +97,7 @@ fn write_statement_and_trigger_calls_fail_without_changing_jobs() {
 
 #[test]
 fn unfinished_returning_cursor_requires_finishing_before_separate_select() {
-    for op in OPERATIONS {
+    for op in RESTRICTED {
         let (c, call) = setup(op);
         let before = live(&c);
         {
@@ -90,7 +109,7 @@ fn unfinished_returning_cursor_requires_finishing_before_separate_select() {
             let err = c
                 .query_row(&format!("SELECT {call}"), [], |r| r.get::<_, Value>(0))
                 .unwrap_err();
-            check_error(err);
+            check_error(op, err);
             assert_eq!(live(&c), before);
             assert_eq!(count(&c, "_honker_dead"), 0);
             while rows.next().unwrap().is_some() {}
@@ -108,7 +127,7 @@ fn unfinished_returning_cursor_requires_finishing_before_separate_select() {
 
 #[test]
 fn separate_select_after_completed_write_keeps_callers_transaction() {
-    for op in OPERATIONS {
+    for op in ALL {
         let (c, call) = setup(op);
         let before = live(&c);
         c.execute_batch("BEGIN; INSERT INTO app VALUES (42)")
@@ -130,16 +149,41 @@ fn separate_select_after_completed_write_keeps_callers_transaction() {
 }
 
 #[test]
-fn direct_core_context_error_keeps_sqlite_busy_code() {
-    let (c, _) = setup("fail");
-    let mut stmt = c
-        .prepare("INSERT INTO app VALUES (1),(2) RETURNING x")
-        .unwrap();
-    let mut rows = stmt.query([]).unwrap();
-    rows.next().unwrap();
-    let err = honker_ops::fail(&c, 1, "w", "boom").unwrap_err();
-    assert!(
-        matches!(&err, Error::SqliteFailure(code, _) if code.code == rusqlite::ErrorCode::DatabaseBusy)
-    );
-    check_error(err);
+fn pending_retry_works_in_write_contexts() {
+    for context in ["insert", "returning", "trigger", "open_cursor"] {
+        let (c, call) = setup("retry_pending");
+        match context {
+            "insert" => c
+                .execute_batch(&format!("INSERT INTO app SELECT {call}"))
+                .unwrap(),
+            "returning" => c
+                .execute_batch(&format!("INSERT INTO app VALUES (1) RETURNING {call}"))
+                .unwrap(),
+            "trigger" => c
+                .execute_batch(&format!(
+                    "CREATE TRIGGER job_action AFTER INSERT ON app BEGIN SELECT {call}; END;
+                     INSERT INTO app VALUES (1)"
+                ))
+                .unwrap(),
+            _ => {
+                let mut stmt = c
+                    .prepare("INSERT INTO app VALUES (1),(2) RETURNING x")
+                    .unwrap();
+                let mut rows = stmt.query([]).unwrap();
+                assert!(rows.next().unwrap().is_some());
+                let n: i64 = c
+                    .query_row(&format!("SELECT {call}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(n, 1);
+                while rows.next().unwrap().is_some() {}
+            }
+        }
+        let job: serde_json::Value = serde_json::from_str(&live(&c)).unwrap();
+        assert_eq!(job["state"], "pending", "pending retry in {context}");
+        assert!(
+            count(&c, "app") >= 1,
+            "outer write must commit in {context}"
+        );
+        assert!(c.is_autocommit());
+    }
 }
