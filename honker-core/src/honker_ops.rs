@@ -2221,7 +2221,6 @@ mod real_arg_tests {
     }
 }
 
-
 // Five lookups used to end in `.ok()`, which throws away every error
 // and not just QueryReturnedNoRows. A real SQLite error read as "no
 // row" turns a broken database into a silent no-op. Each site gets two
@@ -3379,7 +3378,6 @@ mod claimed_at_tests {
         .unwrap()
     }
 }
-
 
 // Queue-scoped cancel (issue #134). `honker_cancel` carries a global
 // 1-arg form and a queue-scoped 2-arg form on the same connection while
