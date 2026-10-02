@@ -360,12 +360,28 @@ fn retry_survives_commits_from_other_connections_between_steps() {
     }
 }
 
+/// SQLITE_BUSY_SNAPSHOT: a write tried to upgrade a read snapshot that
+/// another connection's commit replaced. busy_timeout never retries it.
+const BUSY_SNAPSHOT: std::ffi::c_int = 517;
+
+fn extended_code(err: &rusqlite::Error) -> Option<std::ffi::c_int> {
+    match err {
+        rusqlite::Error::SqliteFailure(e, _) => Some(e.extended_code),
+        _ => None,
+    }
+}
+
 /// Free-running version of the test above: several threads, each with its
 /// own WAL connection, claim and retry from one shared pool. Small enough
 /// for CI; reviews/retry_stress.py runs the multi-process version against
 /// the loadable extension.
+///
+/// Uses the direct API so the extended error code is visible. A plain
+/// SQLITE_BUSY after busy_timeout is lock starvation under this tight loop
+/// (seen on Windows CI) and is tolerated. SQLITE_BUSY_SNAPSHOT is the
+/// read-then-write failure and must never happen.
 #[test]
-fn retry_under_contention_never_errors() {
+fn retry_under_contention_never_hits_a_stale_snapshot() {
     let (dir, path) = temp_db("contention");
     {
         let conn = open_waiting(&path);
@@ -381,27 +397,43 @@ fn retry_under_contention_never_errors() {
                 let worker = format!("w{t}");
                 let mut retried = 0;
                 for _ in 0..100 {
-                    let claimed = honker_ops::claim_batch(&conn, "q", &worker, 1, 300).unwrap();
+                    std::thread::yield_now();
+                    let claimed = match honker_ops::claim_batch(&conn, "q", &worker, 1, 300) {
+                        Ok(claimed) => claimed,
+                        Err(e) if extended_code(&e) == Some(rusqlite::ffi::SQLITE_BUSY) => {
+                            continue;
+                        }
+                        Err(e) => panic!("claim failed: {e:?}"),
+                    };
                     let jobs: serde_json::Value = serde_json::from_str(&claimed).unwrap();
                     let Some(id) = jobs[0]["id"].as_i64() else {
                         continue;
                     };
-                    let n: i64 = conn
-                        .query_row(
-                            "SELECT honker_retry(?1, ?2, 0, 'e')",
-                            rusqlite::params![id, worker],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or_else(|e| panic!("retry failed under contention: {e}"));
-                    assert_eq!(n, 1, "the worker still owned job {id}");
-                    retried += 1;
+                    match honker_ops::retry(&conn, id, &worker, 0, "e") {
+                        Ok(n) => {
+                            assert_eq!(n, 1, "the worker still owned job {id}");
+                            retried += 1;
+                        }
+                        Err(e) => {
+                            assert_ne!(
+                                extended_code(&e),
+                                Some(BUSY_SNAPSHOT),
+                                "retry hit a stale read snapshot: {e:?}"
+                            );
+                            assert_eq!(
+                                extended_code(&e),
+                                Some(rusqlite::ffi::SQLITE_BUSY),
+                                "unexpected retry error: {e:?}"
+                            );
+                        }
+                    }
                 }
                 retried
             })
         })
         .collect();
     let total: i64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
-    assert!(total > 0);
+    assert!(total > 0, "no retry succeeded");
     std::fs::remove_dir_all(dir).unwrap();
 }
 
