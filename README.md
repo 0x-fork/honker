@@ -229,8 +229,10 @@ A valid lease can therefore carry a timestamp from an earlier attempt.
    Until then, display `NULL` as **unknown**, not zero seconds.
 
 If old and new workers already ran together, their affected claim times cannot
-be reconstructed from the database. With **all workers stopped**, use a new
-extension on a maintenance connection and mark the existing times unknown:
+be reconstructed from the database. The same applies after a rollback: if old
+code ran against the upgraded database at any point, it may have left stale
+times even with no mixed fleet. In either case, with **all workers stopped**,
+open a maintenance connection and mark the existing times unknown:
 
 ```sql
 BEGIN IMMEDIATE;
