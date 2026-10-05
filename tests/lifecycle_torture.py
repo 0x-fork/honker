@@ -17,6 +17,11 @@ This module has three parts:
 * ``check``: reads every ledger and the final database and reports
   violations of the lifecycle invariants (see ``INVARIANTS``).
 
+Handlers call the fenced forms by default (``honker_ack(id, worker,
+attempt)`` and friends, passing the ``attempts`` their claim returned).
+``fenced=False`` drives the legacy unfenced forms instead, which fail
+the fencing invariant when two processes share a worker id (#176).
+
 No binding code is used. Only the extension's SQL functions.
 
 Run one worker by hand: ``python tests/lifecycle_torture.py worker <json-config>``.
@@ -181,24 +186,35 @@ def _claim(conn, queue, wid, n, lease):
     return do
 
 
-def _lifecycle(conn, op, jid, wid, rng):
+def _lifecycle(conn, op, jid, att, wid, rng, fenced):
+    # Fenced forms take the claim's attempts as a trailing token.
+    tok = ", ?" if fenced else ""
+    extra = (att,) if fenced else ()
     if op == "ack":
-        return lambda: _scalar(conn, "SELECT honker_ack(?, ?)", (jid, wid)), {}
+        return lambda: _scalar(conn, f"SELECT honker_ack(?, ?{tok})", (jid, wid, *extra)), {}
     if op == "retry":
         d = rng.randint(0, 1)
         return (
-            lambda: _scalar(conn, "SELECT honker_retry(?, ?, ?, 'torture retry')", (jid, wid, d)),
+            lambda: _scalar(
+                conn, f"SELECT honker_retry(?, ?, ?, 'torture retry'{tok})", (jid, wid, d, *extra)
+            ),
             {"delay": d},
         )
     if op == "fail":
-        return lambda: _scalar(conn, "SELECT honker_fail(?, ?, 'torture fail')", (jid, wid)), {}
+        return (
+            lambda: _scalar(conn, f"SELECT honker_fail(?, ?, 'torture fail'{tok})", (jid, wid, *extra)),
+            {},
+        )
     if op == "heartbeat":
         e = rng.randint(1, 2)
-        return lambda: _scalar(conn, "SELECT honker_heartbeat(?, ?, ?)", (jid, wid, e)), {"extend": e}
+        return (
+            lambda: _scalar(conn, f"SELECT honker_heartbeat(?, ?, ?{tok})", (jid, wid, e, *extra)),
+            {"extend": e},
+        )
     raise ValueError(op)
 
 
-def _handle(conn, led, rng, wid, job):
+def _handle(conn, led, rng, wid, job, fenced):
     jid, att = job["id"], job["att"]
     # A little "work" so SIGKILLs often land mid-handler.
     time.sleep(rng.uniform(0.0, 0.15))
@@ -223,8 +239,8 @@ def _handle(conn, led, rng, wid, job):
         if plan[0] == "heartbeat":
             plan.append("ack")
     for op in plan:
-        fn, extra = _lifecycle(conn, op, jid, wid, rng)
-        ok, ret = led.call(op, fn, id=jid, att=att, **extra)
+        fn, extra = _lifecycle(conn, op, jid, att, wid, rng, fenced)
+        ok, ret = led.call(op, fn, id=jid, att=att, fenced=fenced, **extra)
         if op == "heartbeat":
             if not ok or ret != 1:
                 return
@@ -247,6 +263,7 @@ def worker_main(cfg: dict) -> None:
     rng = random.Random(cfg["seed"])
     wid = cfg["wid"]
     tag = cfg["tag"]
+    fenced = cfg.get("fenced", True)
     led = Ledger(cfg["ledger"], tag, wid)
     conn = connect(cfg["db"], cfg["ext"])
     led.write({"ev": "start", "seed": cfg["seed"], "pid": os.getpid()})
@@ -268,7 +285,7 @@ def worker_main(cfg: dict) -> None:
                 )
                 if ok:
                     for job in res["jobs"]:
-                        _handle(conn, led, rng, wid, job)
+                        _handle(conn, led, rng, wid, job, fenced)
                 if not ok or not res["jobs"]:
                     time.sleep(rng.uniform(0.01, 0.08))
             else:
@@ -309,7 +326,13 @@ def _spawn(cfg, log_dir):
 
 
 def run_torture(
-    workdir: str, ext_path: str, seed: int, seconds: float, procs: int = 6, shared_ids: bool = True
+    workdir: str,
+    ext_path: str,
+    seed: int,
+    seconds: float,
+    procs: int = 6,
+    shared_ids: bool = True,
+    fenced: bool = True,
 ) -> RunResult:
     rng = random.Random(seed)
     db_path = os.path.join(workdir, "torture.db")
@@ -325,7 +348,9 @@ def run_torture(
         wids.append(f"w{i // 2}" if (shared_ids and i < 4) else f"w{i}")
 
     coord = Ledger(os.path.join(workdir, "coord.jsonl"), "coord", "-")
-    coord.write({"ev": "run", "seed": seed, "seconds": seconds, "procs": procs, "wids": wids})
+    coord.write(
+        {"ev": "run", "seed": seed, "seconds": seconds, "procs": procs, "wids": wids, "fenced": fenced}
+    )
     deadline = time.time() + seconds
     ledgers = []
     live = {}  # slot -> (proc, cfg)
@@ -343,6 +368,7 @@ def run_torture(
             "ext": ext_path,
             "ledger": os.path.join(workdir, f"{tag}.jsonl"),
             "deadline": deadline,
+            "fenced": fenced,
         }
         ledgers.append(cfg["ledger"])
         live[slot] = (_spawn(cfg, workdir), cfg)
@@ -776,7 +802,8 @@ def main(argv):
         os.makedirs(workdir, exist_ok=True)
         ext = find_extension()
         shared = os.environ.get("HONKER_TORTURE_SHARED_IDS", "1") != "0"
-        res = run_torture(workdir, ext, seed, seconds, shared_ids=shared)
+        fenced = os.environ.get("HONKER_TORTURE_FENCED", "1") != "0"
+        res = run_torture(workdir, ext, seed, seconds, shared_ids=shared, fenced=fenced)
         rep = check(res)
         print(json.dumps(rep.stats, indent=1))
         for inv in INVARIANTS:
