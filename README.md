@@ -182,6 +182,41 @@ The extension shares tables with the language bindings, so a Python
 worker can claim jobs written by SQL, Node, Ruby, Go, or any other
 binding.
 
+
+### SQL call context
+
+`honker_claim_batch`, `honker_fail`, `honker_sweep_expired`, and a
+`honker_retry` that moves the job to `_honker_dead` (its attempts are used
+up) must run as a **separate SELECT**, after any write cursors on that
+connection are finished. Do not call them inside a trigger, an
+INSERT/UPDATE/DELETE, or a RETURNING expression. An unfinished
+`INSERT ... RETURNING` cursor also blocks them, even when the call itself
+is a separate SELECT.
+
+These operations use a savepoint so that a failure partway through cannot
+lose the job. SQLite cannot open a savepoint while a write statement is
+active, and the error says so. A larger `busy_timeout` does not help:
+finish or close the write cursor. A `honker_retry` that puts the job back
+to pending is a single UPDATE with no savepoint, so it works in those
+contexts. The branch depends on the job's attempts, so if a call might be
+the final attempt, run `honker_retry` as a separate SELECT too.
+
+An explicit application transaction is supported and keeps all work
+atomic. Use `BEGIN IMMEDIATE`: it takes the write lock up front, so other
+connections' commits cannot fail the transaction partway through.
+
+```sql
+BEGIN IMMEDIATE;
+UPDATE app_orders SET status = 'failed' WHERE id = 42;
+-- If using RETURNING above, finish its cursor before the next statement.
+SELECT honker_fail(7, 'worker-1', 'delivery rejected');
+COMMIT;
+```
+
+The application must roll back the transaction on an error. Versions
+before savepoint-protected job transitions accepted these calls inside DML;
+keep them as separate statements instead.
+
 ### How long has this job been running
 
 `_honker_live.claimed_at` is when the CURRENT claim started. Nothing
@@ -209,6 +244,42 @@ were already in flight when an existing database was upgraded: the
 migration adds the column without backfilling, because a backfill would
 date those rows to upgrade time and read as a claim that never happened.
 They pick up a real value on their next claim.
+
+
+### Upgrading workers for `claimed_at`
+
+Use a stop/upgrade/resume cutover for all Honker processes sharing a database.
+Do not run old and new queue workers together if you rely on claim timestamps:
+old retry code does not clear `claimed_at`, and old claim code does not set it.
+A valid lease can therefore carry a timestamp from an earlier attempt.
+
+1. Stop every old producer, worker, scheduler, and other Honker process using the
+   database. Let in-flight handlers finish, or stop them under your normal
+   at-least-once recovery procedure.
+2. Upgrade all bindings and native extensions that access that database.
+3. Open it with the new code and run the normal bootstrap. Existing jobs and
+   leases are preserved. Previously in-flight jobs have an unknown (`NULL`)
+   claim start; no timestamp is invented for them.
+4. Resume only upgraded processes. A new claim/reclaim records a fresh start.
+   Until then, display `NULL` as **unknown**, not zero seconds.
+
+If old and new workers already ran together, their affected claim times cannot
+be reconstructed from the database. The same applies after a rollback: if old
+code ran against the upgraded database at any point, it may have left stale
+times even with no mixed fleet. In either case, with **all workers stopped**,
+open a maintenance connection and mark the existing times unknown:
+
+```sql
+BEGIN IMMEDIATE;
+UPDATE _honker_live SET claimed_at = NULL;
+COMMIT;
+```
+
+Then resume upgraded processes. This deliberately clears even times that might
+have been correct, because the database does not identify which version wrote
+each row. It does not change job state, worker ownership, attempts, payload, or
+lease deadlines. It does not requeue jobs or infer historical timestamps.
+Never run this repair automatically on every bootstrap.
 
 ## Architecture
 

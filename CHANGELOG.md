@@ -1,5 +1,93 @@
 # CHANGELOG
 
+## Unreleased — queue-scoped cancel in core (issue #134)
+
+- `honker_cancel(queue, job_id)` joins the existing `honker_cancel(job_id)`.
+  The 2-arg form only removes a pending or processing row that is in that
+  queue; a job in another queue is a miss and returns 0, the same answer an
+  already-ack'd id gives. The queue check is part of the DELETE, not a read
+  before it — a `SELECT queue` followed by a `DELETE` leaves a window for a
+  concurrent claim to change the row between the two statements.
+- The 1-arg form is unchanged and stays: it is the global cancel that
+  `Database.cancel(id)` will use. SQLite dispatches on (name, arity), so both
+  forms live on one connection and bindings can move to the scoped form one
+  package at a time instead of in lockstep.
+- New connect-time capability probe, `honker_core::has_queue_scoped_cancel`
+  and the `CANCEL_QUEUE_SCOPED_PROBE_SQL` string behind it. Calling
+  `honker_cancel` at an arity the loaded extension does not have is a hard
+  SQLite error, not a fallback, and there is no `honker_version()` to ask
+  first — so a binding built for the 2-arg form running against an older
+  vendored `libhonker_ext` would fail at cancel time in production.
+  `pragma_function_list` reports each arity as its own row, so one cheap
+  query at startup turns that into a connect-time check. Bindings that talk
+  to the extension over SQL run the string; Rust-side bindings call the
+  helper. The probe propagates errors rather than reporting "absent" for
+  "cannot tell".
+- Core only. No binding calls the new arity yet, so no existing behavior
+  changes: every current caller keeps hitting `honker_cancel(job_id)`.
+- Tests cover both arities on one connection, the wrong-queue no-op on
+  pending and processing rows (asserting the row is still live afterwards),
+  the owning queue cancelling a claimed row at both arities, idempotence,
+  the arity error, and the probe with and without the 2-arg form,
+  including that an unanswerable probe is an error and not a `false` —
+  in honker-core against rusqlite, and again through the real
+  `.load libhonker_ext` path in `tests/test_extension_interop.py`.
+- The shared ORM surface (`scripts/proof/orm/surface.json`, replayed by
+  every documented ORM recipe in 11 languages) gains the scoped cancel
+  and the capability probe. That is what proves the new arity and
+  `pragma_function_list` work through each binding's own SQLite build,
+  not just through rusqlite and CPython's.
+
+## Unreleased — claim timestamp upgrade procedure
+
+- Upgrade all Honker processes sharing a database before relying on `claimed_at`.
+  Mixed old/new workers can retain an earlier attempt's timestamp. The README
+  now describes a stop/upgrade/resume cutover and a maintenance-only reset to
+  unknown timestamps if mixed workers already ran. Job state and leases survive.
+- CI checks the procedure against the actual pre-column extension and the
+  current extension. Legacy in-flight claims remain unknown until a new claim.
+
+## Unreleased — remaining core lookup errors
+
+- Queue deadlines, scheduler deadlines, scheduler updates, and stream checkpoint
+  reads now report database errors instead of returning zero. Genuine absent
+  rows/deadlines still return zero. A corrupt checkpoint is not a new consumer.
+
+## Unreleased — SQL call context for protected job transitions
+
+- `honker_claim_batch`, `honker_fail`, `honker_sweep_expired`, and a
+  `honker_retry` that dead-letters the job must run as a separate SELECT
+  after write/RETURNING cursors are finished. They are not supported inside
+  triggers or write statements. A `honker_retry` that returns the job to
+  pending has no savepoint and is not restricted.
+- The error now names the function the caller used and explains how to call
+  it, instead of only saying that SQL statements are in progress.
+- Explicit caller transactions remain supported; the docs recommend
+  `BEGIN IMMEDIATE`.
+- Do not remove savepoint protection to restore old invocation patterns: it
+  prevents failed transitions from silently losing jobs.
+
+## Unreleased — retry claim ownership
+
+- `honker_retry` checks ownership in the same statement that changes the
+  job. Before, it read the row and then wrote it in a separate statement,
+  so another connection could cancel or reclaim the job in between. Retry
+  then overwrote the new worker's claim, or moved a cancelled job into
+  `_honker_dead`.
+- Pending branch: one `UPDATE` guarded by worker, `state = 'processing'`,
+  an unexpired lease and `attempts < max_attempts`. It uses no savepoint,
+  so it still works inside triggers and `INSERT ... SELECT`.
+- Exhausted branch: a guarded `DELETE ... RETURNING` and the
+  `_honker_dead` insert in one savepoint, the same shape as `fail()`. A
+  dead row is written only from a row that DELETE removed.
+  A short read after the failed UPDATE decides whether to open that
+  savepoint, so a miss opens none. The DELETE rechecks every guard.
+- A claim that was cancelled, reclaimed or expired returns 0, as before.
+  Retry's first statement is a write, so it never holds an old read
+  snapshot. Commits from other connections, including unrelated ones, do
+  not cause `database is locked` errors; busy_timeout covers waiting for
+  the lock.
+
 ## Unreleased — `claimed_at` on `_honker_live`
 
 - New nullable `claimed_at INTEGER` column on `_honker_live`: when the
