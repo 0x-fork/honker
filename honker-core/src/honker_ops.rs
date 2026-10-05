@@ -456,9 +456,10 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // registered task whose `next_fire_at <= now`, enqueues the
     // payload into the task's queue, advances `next_fire_at` to the
     // next cron boundary, and appends `{name, queue, fire_at,
-    // job_id}` to the output array. Caller typically holds
-    // `_honker_locks` entry 'honker-scheduler' for mutual
-    // exclusion across scheduler processes.
+    // job_id}` to the output array. Atomic on its own (#173): ticks
+    // from any number of connections enqueue each boundary once. A
+    // scheduler leader still holds the `_honker_locks` entry
+    // 'honker-scheduler' so only one process runs the loop.
     conn.create_scalar_function(
         "honker_scheduler_tick",
         1,
@@ -1211,7 +1212,36 @@ pub fn enqueue(
     expires: Option<i64>,
 ) -> rusqlite::Result<i64> {
     check_max_attempts("honker_enqueue", max_attempts)?;
-    let now: i64 = conn.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+    let now = now_unix(conn)?;
+    enqueue_at(
+        conn,
+        now,
+        queue,
+        payload,
+        run_at,
+        delay,
+        priority,
+        max_attempts,
+        expires,
+    )
+}
+
+/// [`enqueue`] with the clock already read. `now` stands in for
+/// `unixepoch()` in every rule above, so a caller that enqueues several
+/// jobs in one operation ([`scheduler_tick`]) gives them all one time.
+/// The caller checks `max_attempts`.
+#[allow(clippy::too_many_arguments)]
+fn enqueue_at(
+    conn: &Connection,
+    now: i64,
+    queue: &str,
+    payload: &str,
+    run_at: Option<i64>,
+    delay: Option<i64>,
+    priority: i64,
+    max_attempts: i64,
+    expires: Option<i64>,
+) -> rusqlite::Result<i64> {
     let run_at_val: i64 = match (delay, run_at) {
         (Some(d), _) => now + d,
         (None, Some(r)) => r,
@@ -2015,36 +2045,92 @@ pub const SCHEDULER_MAX_CATCHUP_FIRES: i64 = 64;
 /// to the next boundary. Keeps advancing within one tick while
 /// boundaries remain in the past (catches up after a scheduler
 /// outage), up to [`SCHEDULER_MAX_CATCHUP_FIRES`] per task.
-/// Returns a JSON array of `{name, queue, fire_at, job_id}` fires.
+/// Returns a JSON array of `{name, queue, fire_at, job_id}` fires,
+/// ordered by task name and then by `fire_at`.
+///
+/// Atomic on its own, in autocommit or inside a caller's transaction
+/// (#173). Everything runs in one savepoint, and its first statement is
+/// [`TICK_DUE_SQL`]: a no-op UPDATE that takes the write lock and
+/// returns the due tasks from the snapshot it locked. Reading the due
+/// tasks before taking the lock was the bug:
+///
+///   * Two ticks could both read the same due boundary, and both
+///     enqueued it. Now the second tick waits on the lock
+///     (`busy_timeout`) and then sees the advanced `next_fire_at`.
+///   * Under WAL, a commit from another connection between that read
+///     and the first enqueue failed the tick with "database is locked"
+///     (SQLITE_BUSY_SNAPSHOT), which `busy_timeout` does not retry.
+///     With no read before the write, there is no stale snapshot.
+///   * In autocommit every enqueue committed on its own, so a failure
+///     part-way left jobs whose boundary was not advanced, and the next
+///     tick enqueued them again. Now a failure rolls back the whole
+///     tick: no job is enqueued and no `next_fire_at` moves, and the
+///     error goes to the caller. The next tick fires those boundaries.
+///
+/// The clock is read once: every job this tick enqueues gets the same
+/// `unixepoch()` for its `run_at` and `expires_at`.
+///
+/// A caller no longer needs its own transaction around the tick. One
+/// that has one keeps it: a failure rolls back to the savepoint only.
+/// Inside a transaction that has already read, SQLite can still refuse
+/// the tick's first write with SQLITE_BUSY_SNAPSHOT; that snapshot
+/// belongs to the caller.
 pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<String> {
-    #[allow(clippy::type_complexity)]
-    let tasks: Vec<(String, String, String, String, i64, Option<i64>, i64, i64)> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT name, queue, cron_expr, payload, priority, expires_s,
-                    next_fire_at, COALESCE(max_attempts, 3)
-             FROM _honker_scheduler_tasks
-             WHERE next_fire_at <= ?1 AND enabled = 1",
-        )?;
-        stmt.query_map(rusqlite::params![now_unix], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, Option<i64>>(5)?,
-                r.get::<_, i64>(6)?,
-                r.get::<_, i64>(7)?,
-            ))
+    in_savepoint(conn, "honker_scheduler_tick", || {
+        scheduler_tick_inner(conn, now_unix)
+    })
+}
+
+/// Takes the write lock and returns the due tasks. The `SET` changes
+/// nothing; `scheduler_tick_inner` writes the real `next_fire_at`.
+/// An UPDATE takes the write lock even when no row matches, so an idle
+/// tick serializes with other writers too. It writes no page then, so
+/// its commit does not wake `data_version` watchers.
+const TICK_DUE_SQL: &str = "UPDATE _honker_scheduler_tasks
+       SET next_fire_at = next_fire_at
+     WHERE enabled = 1 AND next_fire_at <= ?1
+ RETURNING name, queue, cron_expr, payload, priority, expires_s,
+           next_fire_at, COALESCE(max_attempts, 3)";
+
+struct DueTask {
+    name: String,
+    queue: String,
+    cron_expr: String,
+    payload: String,
+    priority: i64,
+    expires_s: Option<i64>,
+    next_fire_at: i64,
+    max_attempts: i64,
+}
+
+fn scheduler_tick_inner(conn: &Connection, tick_at: i64) -> rusqlite::Result<String> {
+    let mut tasks = conn
+        .prepare_cached(TICK_DUE_SQL)?
+        .query_map(rusqlite::params![tick_at], |r| {
+            Ok(DueTask {
+                name: r.get(0)?,
+                queue: r.get(1)?,
+                cron_expr: r.get(2)?,
+                payload: r.get(3)?,
+                priority: r.get(4)?,
+                expires_s: r.get(5)?,
+                next_fire_at: r.get(6)?,
+                max_attempts: r.get(7)?,
+            })
         })?
-        .collect::<Result<Vec<_>, _>>()?
-    };
+        .collect::<Result<Vec<_>, _>>()?;
+    if tasks.is_empty() {
+        return Ok("[]".to_string());
+    }
+    // RETURNING order is unspecified.
+    tasks.sort_by(|a, b| a.name.cmp(&b.name));
+    // After the UPDATE, so this reads no table before the write lock.
+    let now = now_unix(conn)?;
     let mut out = Vec::new();
-    for (name, queue, cron_expr, payload, priority, expires_s, mut next_fire_at, max_attempts) in
-        tasks
-    {
+    for task in tasks {
+        let mut next_fire_at = task.next_fire_at;
         let mut fires_this_task: i64 = 0;
-        while next_fire_at <= now_unix {
+        while next_fire_at <= tick_at {
             if fires_this_task >= SCHEDULER_MAX_CATCHUP_FIRES {
                 // Skip the remaining backlog. Resume from the next
                 // boundary strictly after now so we don't immediately
@@ -2052,39 +2138,40 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
                 // Intermediate boundaries are intentionally never
                 // enqueued (see SCHEDULER_MAX_CATCHUP_FIRES docs).
                 next_fire_at =
-                    super::cron::next_after_unix(&cron_expr, now_unix).map_err(to_sql_err)?;
+                    super::cron::next_after_unix(&task.cron_expr, tick_at).map_err(to_sql_err)?;
                 break;
             }
             // Enqueue at this boundary. `run_at` is NULL (claimable
             // immediately); `expires` is the task's expires_s if set.
             // max_attempts comes from the schedule row, not a constant.
-            let job_id = enqueue(
+            check_max_attempts("honker_scheduler_tick", task.max_attempts)?;
+            let job_id = enqueue_at(
                 conn,
-                &queue,
-                &payload,
+                now,
+                &task.queue,
+                &task.payload,
                 None,
                 None,
-                priority,
-                max_attempts,
-                expires_s,
+                task.priority,
+                task.max_attempts,
+                task.expires_s,
             )?;
             out.push(json!({
-                "name": name,
-                "queue": queue,
+                "name": task.name,
+                "queue": task.queue,
                 "fire_at": next_fire_at,
                 "job_id": job_id,
             }));
             fires_this_task += 1;
             // Advance to the next boundary strictly after this one.
             next_fire_at =
-                super::cron::next_after_unix(&cron_expr, next_fire_at).map_err(to_sql_err)?;
+                super::cron::next_after_unix(&task.cron_expr, next_fire_at).map_err(to_sql_err)?;
         }
-        // Persist the advanced next_fire_at.
-        conn.execute(
+        conn.prepare_cached(
             "UPDATE _honker_scheduler_tasks
              SET next_fire_at = ?2 WHERE name = ?1",
-            rusqlite::params![name, next_fire_at],
-        )?;
+        )?
+        .execute(rusqlite::params![task.name, next_fire_at])?;
     }
     Ok(Value::Array(out).to_string())
 }

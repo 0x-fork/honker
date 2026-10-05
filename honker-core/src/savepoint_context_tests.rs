@@ -5,8 +5,15 @@ use rusqlite::{Connection, Error, types::Value};
 /// statement is active. A retry that only puts the job back to pending is
 /// one UPDATE with no savepoint and is not restricted; see
 /// `pending_retry_works_in_write_contexts`.
-const RESTRICTED: [&str; 4] = ["claim", "fail", "sweep", "retry_dead"];
-const ALL: [&str; 5] = ["claim", "fail", "sweep", "retry_pending", "retry_dead"];
+const RESTRICTED: [&str; 5] = ["claim", "fail", "sweep", "retry_dead", "tick"];
+const ALL: [&str; 6] = [
+    "claim",
+    "fail",
+    "sweep",
+    "retry_pending",
+    "retry_dead",
+    "tick",
+];
 
 /// The public SQL function each operation calls.
 fn public_name(op: &str) -> &'static str {
@@ -14,6 +21,7 @@ fn public_name(op: &str) -> &'static str {
         "claim" => "honker_claim_batch",
         "fail" => "honker_fail",
         "sweep" => "honker_sweep_expired",
+        "tick" => "honker_scheduler_tick",
         _ => "honker_retry",
     }
 }
@@ -32,10 +40,14 @@ fn setup(op: &str) -> (Connection, String) {
         c.execute_batch("UPDATE _honker_live SET expires_at=unixepoch()-10")
             .unwrap();
     }
+    if op == "tick" {
+        honker_ops::scheduler_register(&c, "t", "q", "@every 1s", "{}", 0, None, 3).unwrap();
+    }
     let call = match op {
         "claim" => "honker_claim_batch('q','w',1,300)".to_string(),
         "fail" => format!("honker_fail({id},'w','boom')"),
         "sweep" => "honker_sweep_expired('q')".to_string(),
+        "tick" => "honker_scheduler_tick(unixepoch() + 5)".to_string(),
         _ => format!("honker_retry({id},'w',0,'boom')"),
     };
     (c, call)
@@ -58,8 +70,22 @@ fn check_error(op: &str, err: Error) {
     );
 }
 
+/// Job 1, the number of live jobs and every schedule's next fire: what
+/// any of the operations could change.
 fn live(c: &Connection) -> String {
-    honker_ops::get_job(c, 1).unwrap()
+    let schedules: String = c
+        .query_row(
+            "SELECT coalesce(group_concat(name || '=' || next_fire_at), '')
+               FROM _honker_scheduler_tasks",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    format!(
+        "{} | {} live | {schedules}",
+        honker_ops::get_job(c, 1).unwrap(),
+        count(c, "_honker_live")
+    )
 }
 fn count(c: &Connection, table: &str) -> i64 {
     c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
@@ -178,7 +204,8 @@ fn pending_retry_works_in_write_contexts() {
                 while rows.next().unwrap().is_some() {}
             }
         }
-        let job: serde_json::Value = serde_json::from_str(&live(&c)).unwrap();
+        let job: serde_json::Value =
+            serde_json::from_str(&honker_ops::get_job(&c, 1).unwrap()).unwrap();
         assert_eq!(job["state"], "pending", "pending retry in {context}");
         assert!(
             count(&c, "app") >= 1,
