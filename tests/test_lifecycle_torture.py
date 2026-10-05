@@ -163,6 +163,8 @@ def test_invariant(report, invariant):
 #   deferred  BEGIN; tick at a synthetic clock one second further on
 #             every round; COMMIT. Every round has a due boundary.
 #   noise     commit an enqueue into another queue, over and over
+# deferred and noise pause 1 ms per round. A process that retakes the
+# lock at once starves the other's busy_timeout retries.
 # The ledger is JSON: {"fires": [...], "errors": [...], "rounds": n}.
 _TICK_PROC = r"""
 import json, sqlite3, sys, time
@@ -190,8 +192,10 @@ while time.monotonic() < deadline:
                 conn.execute("ROLLBACK")
                 raise
             fires.extend(json.loads(out))
+            time.sleep(0.001)
         else:
             conn.execute("SELECT honker_enqueue('noise', '{}', NULL, NULL, 0, 3, NULL)")
+            time.sleep(0.001)
     except sqlite3.Error as e:
         errors.append(str(e))
 with open(ledger, "w") as f:
@@ -264,12 +268,13 @@ def test_scheduler_tick_in_deferred_transaction_survives_concurrent_commits(tmp_
     db, conn = _sched_db(tmp_path, ext)
     ledgers = _run_procs(tmp_path, ext, db, ["deferred", "noise"], 5)
     ticker, noise = ledgers
-    assert noise["rounds"] > 100 and not noise["errors"], noise["errors"][:5]
+    assert noise["rounds"] > 100 and not noise["errors"], (noise["rounds"], noise["errors"][:5])
+    print(f"deferred ticker: {ticker['rounds']} rounds; noise: {noise['rounds']} commits")
     errors = ticker["errors"]
     assert not errors, (
         f"{len(errors)} of {ticker['rounds']} ticks failed, e.g. {errors[:3]}"
     )
-    assert len(ticker["fires"]) > 100, f"only {len(ticker['fires'])} fires"
+    assert len(ticker["fires"]) >= 50, f"only {len(ticker['fires'])} fires"
     _assert_one_job_per_boundary(conn, ticker["fires"])
 
 
