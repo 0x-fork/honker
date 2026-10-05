@@ -251,11 +251,35 @@ set `state = 'scheduled'`. A `pending` row with a future `run_at` is not
 claimed early, but it sits in the ready index and the claim has to step
 over it.
 
+### Scheduler tick
+
+`honker_scheduler_tick(now)` enqueues one job for every due boundary of
+every enabled schedule and advances its `next_fire_at`. A schedule that
+fell more than 64 boundaries behind fires 64 and skips to the next
+boundary after `now`.
+
+A tick is atomic on its own. It needs no surrounding transaction, and
+any number of processes can tick at once:
+
+- Its first statement takes the write lock, so a second tick waits on
+  `busy_timeout` and then sees the advanced `next_fire_at`. Each boundary
+  is enqueued once.
+- If any enqueue fails, the tick returns the error and changes nothing:
+  no job, no advance. The next tick fires those boundaries.
+- Inside a deferred `BEGIN`, call it before the transaction reads
+  anything (or use `BEGIN IMMEDIATE`). Then a commit from another
+  connection cannot fail it with "database is locked".
+
+Before this, a tick read the due schedules before it wrote. Two ticks
+could both enqueue the same boundary, and a failed tick in autocommit
+left jobs behind without advancing, so the next tick enqueued them again
+(issue #173).
+
 ### SQL call context
 
-`honker_claim_batch`, `honker_fail`, `honker_sweep_expired`, and a
-`honker_retry` that moves the job to `_honker_dead` (its attempts are used
-up) must run as a **separate SELECT**, after any write cursors on that
+`honker_claim_batch`, `honker_fail`, `honker_sweep_expired`,
+`honker_scheduler_tick`, and a `honker_retry` that moves the job to
+`_honker_dead` (its attempts are used up) must run as a **separate SELECT**, after any write cursors on that
 connection are finished. Do not call them inside a trigger, an
 INSERT/UPDATE/DELETE, or a RETURNING expression. An unfinished
 `INSERT ... RETURNING` cursor also blocks them, even when the call itself

@@ -1,5 +1,31 @@
 # CHANGELOG
 
+## Unreleased — atomic scheduler tick (issue #173)
+
+- `honker_scheduler_tick` runs in one savepoint, and its first statement
+  is a write that takes the write lock and returns the due schedules
+  (`UPDATE _honker_scheduler_tasks SET next_fire_at = next_fire_at ...
+  RETURNING`). It then enqueues and advances `next_fire_at` under that
+  lock. Before, it read the due schedules first:
+  - Two ticks in autocommit could enqueue the same boundary twice. Two
+    processes ticking `@every 1s` for 10 s enqueued every boundary twice.
+  - Inside a deferred transaction, a commit from another connection
+    between the read and the first enqueue failed the tick with
+    "database is locked" (SQLITE_BUSY_SNAPSHOT).
+  - A failure part-way through an autocommit tick left the jobs it had
+    enqueued without advancing `next_fire_at`, so the next tick enqueued
+    them again.
+- A failed tick now changes nothing and returns the error. Inside a
+  caller's transaction it rolls back to its savepoint only.
+- Every job one tick enqueues gets the same `run_at` (one clock reading).
+- The fires in the result are ordered by schedule name, then `fire_at`.
+- `honker_scheduler_tick` now must run as a separate SELECT, like
+  `honker_claim_batch`: not inside a trigger, an INSERT/UPDATE/DELETE or
+  a RETURNING expression.
+- The catch-up cap (`SCHEDULER_MAX_CATCHUP_FIRES`, 64) and the result
+  format are unchanged. Bindings no longer need a transaction around the
+  tick.
+
 ## Unreleased — claim v2: `scheduled` state, eager expiry (BREAKING; issue #177)
 
 **BREAKING: new job state value. Stop all workers to upgrade.** Old

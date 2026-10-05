@@ -48,6 +48,8 @@ mod lookup_error_tests;
 mod retry_tests;
 #[cfg(test)]
 mod savepoint_context_tests;
+#[cfg(test)]
+mod scheduler_tick_tests;
 #[cfg(feature = "shm-fast-path")]
 mod shm_watcher;
 
