@@ -217,6 +217,40 @@ worker id passes that check and can ack, retry or fail the newer attempt
 example a worker restarted with a fixed id while its old process still
 runs.
 
+### Job states and claim
+
+A row in `_honker_live` is in one of three states:
+
+- `scheduled`: `run_at` is in the future. Enqueue with a delay, or a
+  retry with `delay_s > 0`, writes this state.
+- `pending`: ready to claim.
+- `processing`: claimed. The lease ends at `claim_expires_at`.
+
+Every `honker_claim_batch` reads the clock once, then does three bounded
+housekeeping steps before it claims, each capped at 1000 rows per call:
+
+1. Move due `scheduled` rows to `pending`.
+2. Move expired jobs (`expires_at` passed) to `_honker_dead` with
+   `'expired'`. This includes in-flight jobs whose lease has lapsed. A
+   job whose lease is still valid is left to its worker.
+3. Move lapsed leases with no attempts left to `_honker_dead` with
+   `'max attempts exceeded'`.
+
+It then claims `pending` rows and lapsed leases in `priority DESC,
+run_at, id` order. A lapsed lease stays `processing` until it is
+reclaimed, so a fenced late ack still works until then. Because the
+claim expires jobs itself, `honker_sweep_expired` is optional. Use it to
+clear a queue that no worker claims from.
+
+`max_attempts` must be at least 1. `honker_enqueue`,
+`honker_scheduler_register` and `honker_scheduler_update` reject 0 and
+negative values with an error.
+
+If you INSERT into `_honker_live` directly with a future `run_at`, also
+set `state = 'scheduled'`. A `pending` row with a future `run_at` is not
+claimed early, but it sits in the ready index and the claim has to step
+over it.
+
 ### SQL call context
 
 `honker_claim_batch`, `honker_fail`, `honker_sweep_expired`, and a
@@ -266,10 +300,12 @@ SELECT id, queue, unixepoch() - claimed_at AS running_s
 ```
 
 `claimed_at` is only meaningful while `claim_expires_at >= unixepoch()`.
-When a claim lapses and nobody reclaims the job — attempts exhausted, no
-worker on that queue, queue drained — honker does not touch the row.
+When a claim lapses and nobody reclaims the job yet (no worker on that
+queue, or the queue is idle), honker does not touch the row.
 `worker_id`, `claim_expires_at` and `claimed_at` all stay put and all go
-stale together, and the next claim overwrites all three. Without the
+stale together. The next claim on that queue either reclaims the job and
+overwrites all three, or, if the job has no attempts left or has
+expired, moves it to `_honker_dead`. Without the
 `claim_expires_at` filter, `unixepoch() - claimed_at` keeps counting up
 for an attempt nobody is running.
 
@@ -315,6 +351,33 @@ each row. It does not change job state, worker ownership, attempts, payload, or
 lease deadlines. It does not requeue jobs or infer historical timestamps.
 Never run this repair automatically on every bootstrap.
 
+### Upgrading to the `scheduled` state (claim v2)
+
+This release adds a job state, `scheduled`, and changes the claim
+indexes. Older builds do not know the state: an old worker never claims
+a `scheduled` job, and an old producer writes future jobs as `pending`.
+Use the same stop/upgrade/resume cutover as above for all Honker
+processes sharing a database:
+
+1. Stop every old producer, worker, scheduler, and other Honker process using the
+   database. Let in-flight handlers finish, or stop them under your normal
+   at-least-once recovery procedure.
+2. Upgrade all bindings and native extensions that access that database.
+3. Open it with the new code and run the normal bootstrap. The first
+   bootstrap migrates the database once, in one transaction: future
+   `pending` jobs become `scheduled`, `pending` jobs with no attempts left
+   (`max_attempts` 0 or less) move to `_honker_dead` with
+   `'max attempts exceeded'`, and the old `_honker_live_claim` and
+   `_honker_live_pending_deadline` indexes are dropped. In-flight jobs and
+   their leases are not changed. Several processes may bootstrap at the
+   same time; one migrates and the others see it done.
+4. Resume only upgraded processes.
+
+If an old process bootstraps the database again, it recreates the old
+claim index. The next new bootstrap migrates again, which is safe. Code
+that reads `_honker_live.state` and assumes only `pending` and
+`processing` must also count `scheduled`.
+
 ## Architecture
 
 - One `PRAGMA data_version` watcher per `Database`; the default
@@ -324,10 +387,14 @@ Never run this repair automatically on every bootstrap.
 - 100 subscribers still share one watcher
 - Idle listeners run zero queue/notification SELECTs
 
-Queue claim is one `UPDATE ... RETURNING` through a partial index:
-`(queue, priority DESC, run_at, id) WHERE state IN ('pending','processing')`.
-Ack is one `DELETE`. Retry-exhausted jobs move to `_honker_dead`, so
-claim speed depends on pending/processing jobs, not old queue history.
+Queue claim is one `UPDATE ... RETURNING` that reads the ready index
+`(queue, priority DESC, run_at, id) WHERE state = 'pending'` plus lapsed
+leases from `(queue, claim_expires_at) WHERE state = 'processing'`.
+Scheduled and expiring jobs have their own partial indexes, and the
+housekeeping steps before the claim are capped per call. Claim latency
+does not grow with delayed, in-flight or expired backlog. Ack is one
+`DELETE`. Retry-exhausted jobs move to `_honker_dead`, so claim speed does
+not depend on old queue history.
 
 The language bindings default to WAL because it gives concurrent readers
 with one writer and efficient fsync batching. Other journal modes still

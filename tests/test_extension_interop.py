@@ -11,6 +11,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -719,8 +720,9 @@ def test_extension_ack_singular(ext_db_path):
 
 @pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
 def test_extension_retry_flips_back_without_wake_row(ext_db_path):
-    """honker_retry flips the claim back to pending with run_at pushed.
-    No synthetic notification row — wake is data_version from the UPDATE.
+    """honker_retry with a delay puts the claim back as 'scheduled' with
+    run_at pushed (a delay of 0 would write 'pending'). No synthetic
+    notification row — wake is data_version from the UPDATE.
     """
     conn = _open_ext(ext_db_path)
     conn.execute("SELECT honker_enqueue('rq', '{}', NULL, NULL, 0, 5, NULL)")
@@ -744,7 +746,7 @@ def test_extension_retry_flips_back_without_wake_row(ext_db_path):
         "SELECT state, run_at, worker_id, attempts FROM _honker_live"
     ).fetchone()
     state, ra, wid, attempts = row
-    assert state == "pending"
+    assert state == "scheduled"
     assert wid is None
     assert attempts == 1  # incremented during claim; not decremented
     now = conn.execute("SELECT unixepoch()").fetchone()[0]
@@ -1136,3 +1138,172 @@ def test_extension_fenced_ack_batch_takes_id_attempt_pairs(ext_db_path):
     assert conn.execute("SELECT honker_ack_batch(?, 'w')", [pairs]).fetchone()[0] == 2
     assert _row(conn, a)[:3] == ("processing", "w", 1)
     assert _row(conn, b) is None and _row(conn, c) is None
+
+
+# ---------- claim v2: scheduled state, eager expiry, ordering ----------
+
+
+def _ext_conn(path):
+    conn = _open_ext(path)
+    conn.isolation_level = None
+    return conn
+
+
+def _now(conn):
+    return conn.execute("SELECT unixepoch()").fetchone()[0]
+
+
+def _wait_until(conn, t):
+    """Sleep until the database clock reads at least `t`."""
+    while _now(conn) < t:
+        time.sleep(0.05)
+
+
+def _dead(conn, job_id):
+    row = conn.execute(
+        "SELECT last_error FROM _honker_dead WHERE id = ?", [job_id]
+    ).fetchone()
+    return row and row[0]
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_extension_issue_177_expired_in_flight_job_goes_to_dead(ext_db_path):
+    """Issue #177's repro, with the worker in its own process. It claims a
+    job that expires in 1 s with a 1 s lease, then dies. After both pass,
+    another worker's claim must not leave the job `processing` forever:
+    it moves it to `_honker_dead` as 'expired'."""
+    conn = _ext_conn(ext_db_path)
+    jid = conn.execute(
+        """SELECT honker_enqueue('q177', '{"n":1}', NULL, NULL, 0, 3, 1)"""
+    ).fetchone()[0]
+    (claimed,) = _in_other_process(
+        ext_db_path, ("SELECT honker_claim_batch('q177', 'w', 1, 1)", [])
+    )
+    (job,) = json.loads(claimed)
+    assert job["id"] == jid
+    _wait_until(conn, job["claim_expires_at"] + 1)
+    assert _row(conn, jid)[0] == "processing", "precondition: lapsed, expired, still live"
+
+    (again,) = _in_other_process(
+        ext_db_path, ("SELECT honker_claim_batch('q177', 'w2', 1, 1)", [])
+    )
+    assert json.loads(again) == []
+    assert _row(conn, jid) is None
+    assert _dead(conn, jid) == "expired"
+    assert conn.execute("SELECT honker_sweep_expired('q177')").fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_extension_sweep_expired_takes_a_lapsed_in_flight_job(ext_db_path):
+    """sweep_expired uses the same rule as the claim: an expired row whose
+    lease lapsed goes to dead; one with a valid lease stays with its owner,
+    whose fenced ack still works."""
+    conn = _ext_conn(ext_db_path)
+    gone = conn.execute(
+        "SELECT honker_enqueue('qsw', '{}', NULL, NULL, 0, 3, 3600)"
+    ).fetchone()[0]
+    held = conn.execute(
+        "SELECT honker_enqueue('qsw', '{}', NULL, NULL, 0, 3, 3600)"
+    ).fetchone()[0]
+    (claimed,) = _in_other_process(
+        ext_db_path, ("SELECT honker_claim_batch('qsw', 'w', 2, 300)", [])
+    )
+    assert sorted(j["id"] for j in json.loads(claimed)) == [gone, held]
+    conn.execute("UPDATE _honker_live SET expires_at = unixepoch() - 1")
+    _lapse(conn, gone)
+
+    assert _in_other_process(ext_db_path, ("SELECT honker_sweep_expired('qsw')", [])) == [1]
+    assert _dead(conn, gone) == "expired"
+    assert _row(conn, held)[0] == "processing"
+    assert _in_other_process(ext_db_path, ("SELECT honker_ack(?, 'w', 1)", [held])) == [1]
+    conn.close()
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_extension_exhausted_lapsed_lease_goes_to_dead(ext_db_path):
+    """A worker dies on the job's last allowed attempt. The next claim, in
+    another process, dead-letters it and hands out the next job."""
+    conn = _ext_conn(ext_db_path)
+    last = conn.execute(
+        "SELECT honker_enqueue('qex', '{}', NULL, NULL, 0, 1, NULL)"
+    ).fetchone()[0]
+    _in_other_process(ext_db_path, ("SELECT honker_claim_batch('qex', 'w', 1, 60)", []))
+    _lapse(conn, last)
+    nxt = conn.execute(
+        "SELECT honker_enqueue('qex', '{}', NULL, NULL, 0, 3, NULL)"
+    ).fetchone()[0]
+    (claimed,) = _in_other_process(
+        ext_db_path, ("SELECT honker_claim_batch('qex', 'w2', 5, 60)", [])
+    )
+    assert [j["id"] for j in json.loads(claimed)] == [nxt]
+    assert _row(conn, last) is None
+    assert _dead(conn, last) == "max attempts exceeded"
+    conn.close()
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_extension_claim_order_across_promotion_and_reclaim(ext_db_path):
+    """priority DESC, run_at, id over due rows, a promoted scheduled row
+    and a reclaimed lapsed lease, written and claimed by different
+    processes on the real clock."""
+    conn = _ext_conn(ext_db_path)
+    now = _now(conn)
+    enq = "SELECT honker_enqueue('qord', '{}', ?, NULL, ?, 3, NULL)"
+    (a,) = _in_other_process(ext_db_path, (enq, [now, 0]))
+    (b,) = _in_other_process(ext_db_path, (enq, [now - 1, 0]))
+    (c,) = _in_other_process(ext_db_path, (enq, [now + 2, 5]))
+    (d,) = _in_other_process(ext_db_path, (enq, [now, 5]))
+    assert conn.execute(
+        "SELECT state FROM _honker_live WHERE id = ?", [c]
+    ).fetchone()[0] == "scheduled"
+    (first,) = _in_other_process(
+        ext_db_path, ("SELECT honker_claim_batch('qord', 'w0', 1, 60)", [])
+    )
+    assert [j["id"] for j in json.loads(first)] == [d]
+    _lapse(conn, d)
+    (e,) = _in_other_process(ext_db_path, (enq, [now, 5]))
+    _wait_until(conn, now + 2)
+
+    claim = ("SELECT honker_claim_batch('qord', 'w1', 1, 60)", [])
+    order = [json.loads(r)[0]["id"] for r in _in_other_process(ext_db_path, *[claim] * 5)]
+    assert order == [d, e, c, b, a]
+    assert _in_other_process(ext_db_path, claim) == ["[]"]
+    conn.close()
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_extension_scheduled_state_is_visible_and_cancellable(ext_db_path):
+    conn = _ext_conn(ext_db_path)
+    a = conn.execute(
+        "SELECT honker_enqueue('qs', '{}', NULL, 60, 0, 3, NULL)"
+    ).fetchone()[0]
+    b = conn.execute(
+        "SELECT honker_enqueue('qs', '{}', NULL, 60, 0, 3, NULL)"
+    ).fetchone()[0]
+    snap = json.loads(conn.execute("SELECT honker_get_job(?)", [a]).fetchone()[0])
+    assert snap["state"] == "scheduled"
+    assert conn.execute("SELECT honker_queue_next_claim_at('qs')").fetchone()[0] == snap["run_at"]
+    assert _in_other_process(ext_db_path, ("SELECT honker_cancel(?)", [a])) == [1]
+    assert _in_other_process(ext_db_path, ("SELECT honker_cancel('other', ?)", [b])) == [0]
+    assert _in_other_process(ext_db_path, ("SELECT honker_cancel('qs', ?)", [b])) == [1]
+    assert conn.execute("SELECT count(*) FROM _honker_live").fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT honker_enqueue('qm', '{}', NULL, NULL, 0, ?, NULL)",
+        "SELECT honker_scheduler_register('t', 'qm', '@every 1m', '{}', 0, NULL, ?)",
+    ],
+)
+@pytest.mark.parametrize("value", [0, -1])
+def test_extension_max_attempts_below_one_is_rejected(ext_db_path, sql, value):
+    conn = _ext_conn(ext_db_path)
+    with pytest.raises(sqlite3.OperationalError, match="max_attempts must be at least 1"):
+        conn.execute(sql, [value]).fetchone()
+    assert conn.execute("SELECT count(*) FROM _honker_live").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM _honker_scheduler_tasks").fetchone()[0] == 0
+    conn.close()

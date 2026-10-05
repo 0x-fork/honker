@@ -33,10 +33,10 @@ This test fails, rather than skips, when the extension is missing or
 the interpreter's sqlite3 cannot load extensions. It only skips on
 Windows, which has no SIGKILL.
 
-One invariant fails on main today and is marked xfail with its issue:
-stuck expired rows (5, an in-flight job that expires is never swept).
-Remove the marker when its fix lands; the test will then guard the fix.
-Fencing (2) passes with the fenced forms (#176) and is only xfail when
+Every invariant is expected to pass. Expiry (5) guards #177: a job
+that expires in flight (abandoned, stalled or SIGKILLed handlers with
+short ``expires``) must end in ``_honker_dead``, not stay live. Fencing
+(2) passes with the fenced forms (#176) and is only xfail when
 ``HONKER_TORTURE_FENCED=0`` drives the legacy unfenced forms.
 """
 
@@ -60,14 +60,8 @@ SHARED_IDS = os.environ.get("HONKER_TORTURE_SHARED_IDS", "1") != "0"
 FENCED = os.environ.get("HONKER_TORTURE_FENCED", "1") != "0"
 
 FENCING_ISSUE = "https://github.com/russellromney/honker/issues/176"
-STUCK_EXPIRED_ISSUE = "https://github.com/russellromney/honker/issues/177"
 
-KNOWN_BUGS = {
-    "5_expiry": (
-        "main: sweep_expired ignores processing rows and claim skips expired rows, so an "
-        "in-flight job that expires stays live forever. " + STUCK_EXPIRED_ISSUE
-    ),
-}
+KNOWN_BUGS = {}
 if not FENCED:
     KNOWN_BUGS["2_fencing"] = (
         "legacy unfenced ack/retry/fail/heartbeat check worker_id + lease, not the attempt, "
@@ -139,6 +133,10 @@ def test_run_exercised_the_lifecycle(report):
             problems.append(f"no stale-owner {op} miss")
     if s["kills"] == 0 and SECONDS >= 10:
         problems.append("no SIGKILL happened")
+    # #177: the run must actually put jobs through in-flight expiry, or
+    # invariant 5 proves nothing about it.
+    if s["expired_in_flight"] == 0 and SECONDS >= 20:
+        problems.append("no job expired in flight")
     assert not problems, f"seed={report.seed}: weak run: {problems}; stats={s}"
 
 
