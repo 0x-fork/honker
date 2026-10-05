@@ -163,7 +163,7 @@ def test_invariant(report, invariant):
 #   deferred  BEGIN; tick at a synthetic clock one second further on
 #             every round; COMMIT. Every round has a due boundary.
 #   noise     commit an enqueue into another queue, over and over
-# deferred and noise pause 1 ms per round. A process that retakes the
+# Every mode pauses 1 ms per round. A process that retakes the
 # lock at once starves the other's busy_timeout retries.
 # The ledger is JSON: {"fires": [...], "errors": [...], "rounds": n}.
 _TICK_PROC = r"""
@@ -181,6 +181,7 @@ while time.monotonic() < deadline:
         if mode == "tick":
             out = conn.execute("SELECT honker_scheduler_tick(unixepoch())").fetchone()[0]
             fires.extend(json.loads(out))
+            time.sleep(0.001)
         elif mode == "deferred":
             conn.execute("BEGIN")
             try:
