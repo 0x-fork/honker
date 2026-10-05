@@ -38,6 +38,12 @@ pub mod cron;
 mod honker_ops;
 #[cfg(feature = "kernel-watcher")]
 mod kernel_watcher;
+#[cfg(test)]
+mod lookup_error_tests;
+#[cfg(test)]
+mod retry_tests;
+#[cfg(test)]
+mod savepoint_context_tests;
 #[cfg(feature = "shm-fast-path")]
 mod shm_watcher;
 
