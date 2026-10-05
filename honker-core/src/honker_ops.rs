@@ -653,6 +653,26 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         ack(&db, job_id, &worker_id).map_err(to_sql_err)
     })?;
 
+    // Fenced forms. The extra last argument is the `attempts` value the
+    // claim returned for this job: the claim's token. The guard is
+    // `id + worker_id + attempts = token + state = 'processing'`, with
+    // no lease check. A reclaim bumps `attempts` and dead-letter,
+    // expiry and cancel remove the row, so a stale handler (even one
+    // with the same worker id) matches nothing and gets 0, while a
+    // late handler whose job nobody reclaimed still completes. The
+    // shorter forms above are unfenced: they check worker_id and the
+    // lease only. See issue #176.
+    //
+    // honker_ack(job_id, worker_id, attempt) -> 1 if ack'd, 0 if this
+    // attempt no longer owns the job.
+    conn.create_scalar_function("honker_ack", 3, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let job_id: i64 = arg_i64(ctx, 0)?;
+        let worker_id: String = ctx.get(1)?;
+        let attempt: i64 = arg_i64(ctx, 2)?;
+        let db = unsafe { ctx.get_connection() }?;
+        ack_fenced(&db, job_id, &worker_id, attempt).map_err(to_sql_err)
+    })?;
+
     // honker_retry(job_id, worker_id, delay_s, error) -> 1 if retried /
     // moved to dead, 0 if not our claim. If attempts >= max_attempts,
     // moves the row to `_honker_dead` instead of flipping it back
@@ -667,6 +687,18 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         retry(&db, job_id, &worker_id, delay_s, &error).map_err(to_sql_err)
     })?;
 
+    // honker_retry(job_id, worker_id, delay_s, error, attempt): fenced
+    // form of the above. See honker_ack(job_id, worker_id, attempt).
+    conn.create_scalar_function("honker_retry", 5, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let job_id: i64 = arg_i64(ctx, 0)?;
+        let worker_id: String = ctx.get(1)?;
+        let delay_s: i64 = arg_i64(ctx, 2)?;
+        let error: String = ctx.get(3)?;
+        let attempt: i64 = arg_i64(ctx, 4)?;
+        let db = unsafe { ctx.get_connection() }?;
+        retry_fenced(&db, job_id, &worker_id, delay_s, &error, attempt).map_err(to_sql_err)
+    })?;
+
     // honker_fail(job_id, worker_id, error) -> 1 if failed-to-dead, 0 if
     // not our claim.
     conn.create_scalar_function("honker_fail", 3, FunctionFlags::SQLITE_UTF8, |ctx| {
@@ -677,6 +709,16 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         fail(&db, job_id, &worker_id, &error).map_err(to_sql_err)
     })?;
 
+    // honker_fail(job_id, worker_id, error, attempt): fenced form.
+    conn.create_scalar_function("honker_fail", 4, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let job_id: i64 = arg_i64(ctx, 0)?;
+        let worker_id: String = ctx.get(1)?;
+        let error: String = ctx.get(2)?;
+        let attempt: i64 = arg_i64(ctx, 3)?;
+        let db = unsafe { ctx.get_connection() }?;
+        fail_fenced(&db, job_id, &worker_id, &error, attempt).map_err(to_sql_err)
+    })?;
+
     // honker_heartbeat(job_id, worker_id, extend_s) -> 1 if extended, 0
     // if not our claim.
     conn.create_scalar_function("honker_heartbeat", 3, FunctionFlags::SQLITE_UTF8, |ctx| {
@@ -685,6 +727,18 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         let extend_s: i64 = arg_i64(ctx, 2)?;
         let db = unsafe { ctx.get_connection() }?;
         heartbeat(&db, job_id, &worker_id, extend_s).map_err(to_sql_err)
+    })?;
+
+    // honker_heartbeat(job_id, worker_id, extend_s, attempt): fenced
+    // form. Sets claim_expires_at = now + extend_s even if the lease
+    // already lapsed, as long as nobody reclaimed the job.
+    conn.create_scalar_function("honker_heartbeat", 4, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let job_id: i64 = arg_i64(ctx, 0)?;
+        let worker_id: String = ctx.get(1)?;
+        let extend_s: i64 = arg_i64(ctx, 2)?;
+        let attempt: i64 = arg_i64(ctx, 3)?;
+        let db = unsafe { ctx.get_connection() }?;
+        heartbeat_fenced(&db, job_id, &worker_id, extend_s, attempt).map_err(to_sql_err)
     })?;
 
     // honker_cancel(job_id) -> 1 if a pending/processing row was removed,
@@ -958,12 +1012,31 @@ pub fn claim_batch(
 /// is the whole operation. `RETURNING id` is only counted, never
 /// decoded into Rust, and nothing runs after it that could fail and
 /// strand the deleted rows. The jobs are meant to be gone.
+///
+/// Each element of `ids_json` is either a plain id (unfenced: worker_id
+/// and an unexpired lease, as before) or an `[id, attempt]` pair
+/// (fenced: worker_id, `attempts = attempt` and `state = 'processing'`,
+/// no lease check; see [`ack_fenced`]). Both kinds may be mixed in one
+/// call; each element is judged by its own form. A pair is a JSON
+/// array, so it never matches the plain-id branch.
 pub fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite::Result<i64> {
     let mut stmt = conn.prepare_cached(
         "DELETE FROM _honker_live
-         WHERE id IN (SELECT value FROM json_each(?1))
+         WHERE id IN (SELECT CASE WHEN type = 'array'
+                                  THEN json_extract(value, '$[0]')
+                                  ELSE value END
+                      FROM json_each(?1))
            AND worker_id = ?2
-           AND claim_expires_at >= unixepoch()
+           AND (
+             (claim_expires_at >= unixepoch()
+              AND id IN (SELECT value FROM json_each(?1) WHERE type <> 'array'))
+             OR
+             (state = 'processing'
+              AND EXISTS (SELECT 1 FROM json_each(?1)
+                          WHERE type = 'array'
+                            AND json_extract(value, '$[0]') = _honker_live.id
+                            AND json_extract(value, '$[1]') = _honker_live.attempts))
+           )
          RETURNING id",
     )?;
     let mut rows = stmt.query(rusqlite::params![ids_json, worker_id])?;
@@ -1064,11 +1137,40 @@ pub fn enqueue(
 /// Single-job ack. DELETEs the row if the caller's claim is still
 /// valid. Returns 1 on success, 0 if the claim expired or the row
 /// isn't ours.
+///
+/// Unfenced: a stale handler with the same worker id as the current
+/// holder passes this guard. Use [`ack_fenced`] with the claimed
+/// `attempts`.
 pub fn ack(conn: &Connection, job_id: i64, worker_id: &str) -> rusqlite::Result<i64> {
     let deleted = conn.execute(
         "DELETE FROM _honker_live
          WHERE id = ?1 AND worker_id = ?2 AND claim_expires_at >= unixepoch()",
         rusqlite::params![job_id, worker_id],
+    )?;
+    Ok(deleted as i64)
+}
+
+/// Fenced single-job ack. `attempt` is the `attempts` value the claim
+/// returned: the claim's token. DELETEs the row only if it is still
+/// this claim: `id`, `worker_id`, `attempts = attempt` and
+/// `state = 'processing'`. Returns 1 on success, 0 otherwise.
+///
+/// No lease check. A reclaim bumps `attempts`, and dead-letter, expiry
+/// and cancel remove the row, so the token alone tells a stale call
+/// from a late one. A late ack whose job nobody reclaimed succeeds and
+/// the job does not run again; a stale ack after a reclaim, even by the
+/// same worker id, matches nothing (issue #176).
+pub fn ack_fenced(
+    conn: &Connection,
+    job_id: i64,
+    worker_id: &str,
+    attempt: i64,
+) -> rusqlite::Result<i64> {
+    let deleted = conn.execute(
+        "DELETE FROM _honker_live
+         WHERE id = ?1 AND worker_id = ?2 AND attempts = ?3
+           AND state = 'processing'",
+        rusqlite::params![job_id, worker_id, attempt],
     )?;
     Ok(deleted as i64)
 }
@@ -1091,6 +1193,9 @@ pub fn ack(conn: &Connection, job_id: i64, worker_id: &str) -> rusqlite::Result<
 /// (worker, state, unexpired lease, attempts) are checked at write
 /// time, so a job another connection cancelled or reclaimed matches 0
 /// rows and the call returns 0.
+///
+/// Unfenced: worker_id plus the lease, so a stale handler sharing the
+/// new holder's worker id passes. See [`retry_fenced`].
 pub fn retry(
     conn: &Connection,
     job_id: i64,
@@ -1098,20 +1203,108 @@ pub fn retry(
     delay_s: i64,
     error: &str,
 ) -> rusqlite::Result<i64> {
+    retry_with(conn, job_id, worker_id, delay_s, error, None)
+}
+
+/// Fenced [`retry`]. The guard is `id`, `worker_id`, `attempts =
+/// attempt` and `state = 'processing'`, with no lease check; see
+/// [`ack_fenced`]. Same write-first shape: the pending branch is one
+/// guarded UPDATE (plus `attempts < max_attempts`), and the dead branch
+/// is a guarded `DELETE ... RETURNING` plus the `_honker_dead` insert
+/// inside one savepoint.
+pub fn retry_fenced(
+    conn: &Connection,
+    job_id: i64,
+    worker_id: &str,
+    delay_s: i64,
+    error: &str,
+    attempt: i64,
+) -> rusqlite::Result<i64> {
+    retry_with(conn, job_id, worker_id, delay_s, error, Some(attempt))
+}
+
+// The guards, unfenced then fenced. `?1` = id, `?2` = worker_id and,
+// fenced only, `?3` = the claim's attempts token. Shared by the
+// pending UPDATE, the branch read and the dead-letter DELETE so they
+// can never disagree.
+const RETRY_PENDING_SQL: [&str; 2] = [
+    "UPDATE _honker_live
+     SET state = 'pending',
+         run_at = unixepoch() + ?4,
+         worker_id = NULL,
+         claim_expires_at = NULL,
+         claimed_at = NULL
+     WHERE id = ?1 AND worker_id = ?2 AND state = 'processing'
+       AND claim_expires_at >= unixepoch()
+       AND attempts < max_attempts",
+    "UPDATE _honker_live
+     SET state = 'pending',
+         run_at = unixepoch() + ?4,
+         worker_id = NULL,
+         claim_expires_at = NULL,
+         claimed_at = NULL
+     WHERE id = ?1 AND worker_id = ?2 AND attempts = ?3
+       AND state = 'processing'
+       AND attempts < max_attempts",
+];
+const RETRY_EXHAUSTED_SQL: [&str; 2] = [
+    "SELECT 1 FROM _honker_live
+     WHERE id = ?1 AND worker_id = ?2 AND state = 'processing'
+       AND claim_expires_at >= unixepoch()
+       AND attempts >= max_attempts",
+    "SELECT 1 FROM _honker_live
+     WHERE id = ?1 AND worker_id = ?2 AND attempts = ?3
+       AND state = 'processing'
+       AND attempts >= max_attempts",
+];
+const RETRY_DEAD_SQL: [&str; 2] = [
+    "DELETE FROM _honker_live
+     WHERE id = ?1 AND worker_id = ?2 AND state = 'processing'
+       AND claim_expires_at >= unixepoch()
+       AND attempts >= max_attempts
+     RETURNING id, queue, payload, priority, run_at, max_attempts,
+               attempts, created_at",
+    "DELETE FROM _honker_live
+     WHERE id = ?1 AND worker_id = ?2 AND attempts = ?3
+       AND state = 'processing'
+       AND attempts >= max_attempts
+     RETURNING id, queue, payload, priority, run_at, max_attempts,
+               attempts, created_at",
+];
+
+/// Bind `?1` id, `?2` worker_id and, for the fenced text, `?3` the
+/// attempt token. Extra trailing parameters start at `?4`.
+fn bind_guard(
+    stmt: &mut rusqlite::Statement<'_>,
+    job_id: i64,
+    worker_id: &str,
+    attempt: Option<i64>,
+) -> rusqlite::Result<()> {
+    stmt.raw_bind_parameter(1, job_id)?;
+    stmt.raw_bind_parameter(2, worker_id)?;
+    if let Some(a) = attempt {
+        stmt.raw_bind_parameter(3, a)?;
+    }
+    Ok(())
+}
+
+fn retry_with(
+    conn: &Connection,
+    job_id: i64,
+    worker_id: &str,
+    delay_s: i64,
+    error: &str,
+    attempt: Option<i64>,
+) -> rusqlite::Result<i64> {
+    let form = usize::from(attempt.is_some());
     // Pending branch. One statement, so it needs no savepoint and works
     // wherever a plain UPDATE from a scalar function does.
-    let updated = conn.execute(
-        "UPDATE _honker_live
-         SET state = 'pending',
-             run_at = unixepoch() + ?2,
-             worker_id = NULL,
-             claim_expires_at = NULL,
-             claimed_at = NULL
-         WHERE id = ?1 AND worker_id = ?3 AND state = 'processing'
-           AND claim_expires_at >= unixepoch()
-           AND attempts < max_attempts",
-        rusqlite::params![job_id, delay_s, worker_id],
-    )?;
+    let updated = {
+        let mut stmt = conn.prepare_cached(RETRY_PENDING_SQL[form])?;
+        bind_guard(&mut stmt, job_id, worker_id, attempt)?;
+        stmt.raw_bind_parameter(4, delay_s)?;
+        stmt.raw_execute()?
+    };
     if updated > 0 {
         // Wake comes from the live-table UPDATE + commit (data_version).
         // No synthetic notification row — see enqueue() for rationale.
@@ -1122,17 +1315,11 @@ pub fn retry(
     // chooses the path: the DELETE below rechecks every guard, and the
     // UPDATE above already ran, so the read cannot pin an older snapshot
     // ahead of the first write.
-    let exhausted = conn
-        .query_row(
-            "SELECT 1 FROM _honker_live
-             WHERE id = ?1 AND worker_id = ?2 AND state = 'processing'
-               AND claim_expires_at >= unixepoch()
-               AND attempts >= max_attempts",
-            rusqlite::params![job_id, worker_id],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
+    let exhausted = {
+        let mut stmt = conn.prepare_cached(RETRY_EXHAUSTED_SQL[form])?;
+        bind_guard(&mut stmt, job_id, worker_id, attempt)?;
+        stmt.raw_query().next()?.is_some()
+    };
     if !exhausted {
         return Ok(0);
     }
@@ -1140,63 +1327,72 @@ pub fn retry(
     // the INSERT run in one savepoint, so a failure in the second half
     // cannot lose the job.
     in_savepoint(conn, "honker_retry", || {
-        retry_dead_letter(conn, job_id, worker_id, error)
+        let row = {
+            let mut stmt = conn.prepare_cached(RETRY_DEAD_SQL[form])?;
+            bind_guard(&mut stmt, job_id, worker_id, attempt)?;
+            let mut rows = stmt.raw_query();
+            match rows.next()? {
+                Some(r) => Some(DeadRow::from_row(r)?),
+                None => None,
+            }
+        };
+        // Only a row this DELETE actually removed may become a dead row.
+        let Some(row) = row else {
+            return Ok(0);
+        };
+        row.insert_dead(conn, error)?;
+        Ok(1)
     })
 }
 
-fn retry_dead_letter(
-    conn: &Connection,
-    job_id: i64,
-    worker_id: &str,
-    error: &str,
-) -> rusqlite::Result<i64> {
-    #[allow(clippy::type_complexity)]
-    let row: Option<(i64, String, String, i64, i64, i64, i64, i64)> = conn
-        .query_row(
-            "DELETE FROM _honker_live
-             WHERE id = ?1 AND worker_id = ?2 AND state = 'processing'
-               AND claim_expires_at >= unixepoch()
-               AND attempts >= max_attempts
-             RETURNING id, queue, payload, priority, run_at, max_attempts,
-                       attempts, created_at",
-            rusqlite::params![job_id, worker_id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                ))
-            },
-        )
-        .optional()?;
-    // Only a row this DELETE actually removed may become a dead row.
-    let Some((id, queue, payload, priority, run_at, max_attempts, attempts, created_at)) = row
-    else {
-        return Ok(0);
-    };
-    conn.execute(
-        "INSERT INTO _honker_dead
-           (id, queue, payload, priority, run_at, max_attempts,
-            attempts, last_error, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        rusqlite::params![
-            id,
-            queue,
-            payload,
-            priority,
-            run_at,
-            max_attempts,
-            attempts,
-            error,
-            created_at
-        ],
-    )?;
-    Ok(1)
+/// A row just removed from `_honker_live` by `DELETE ... RETURNING id,
+/// queue, payload, priority, run_at, max_attempts, attempts,
+/// created_at`, on its way to `_honker_dead`.
+struct DeadRow {
+    id: i64,
+    queue: String,
+    payload: String,
+    priority: i64,
+    run_at: i64,
+    max_attempts: i64,
+    attempts: i64,
+    created_at: i64,
+}
+
+impl DeadRow {
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: r.get(0)?,
+            queue: r.get(1)?,
+            payload: r.get(2)?,
+            priority: r.get(3)?,
+            run_at: r.get(4)?,
+            max_attempts: r.get(5)?,
+            attempts: r.get(6)?,
+            created_at: r.get(7)?,
+        })
+    }
+
+    fn insert_dead(&self, conn: &Connection, error: &str) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO _honker_dead
+               (id, queue, payload, priority, run_at, max_attempts,
+                attempts, last_error, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                self.id,
+                self.queue,
+                self.payload,
+                self.priority,
+                self.run_at,
+                self.max_attempts,
+                self.attempts,
+                error,
+                self.created_at
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 /// Unconditionally move the claim to `_honker_dead` with the given
@@ -1209,62 +1405,62 @@ fn retry_dead_letter(
 /// error out of the mapper alone does NOT undo the DELETE. So the
 /// delete-decode-insert runs inside [`in_savepoint`], which rolls it
 /// back before propagating.
+///
+/// Unfenced: worker_id plus the lease. See [`fail_fenced`].
 pub fn fail(conn: &Connection, job_id: i64, worker_id: &str, error: &str) -> rusqlite::Result<i64> {
     in_savepoint(conn, "honker_fail", || {
-        fail_inner(conn, job_id, worker_id, error)
+        fail_inner(conn, job_id, worker_id, error, None)
     })
 }
+
+/// Fenced [`fail`]. The guard is `id`, `worker_id`, `attempts =
+/// attempt` and `state = 'processing'`, with no lease check; see
+/// [`ack_fenced`].
+pub fn fail_fenced(
+    conn: &Connection,
+    job_id: i64,
+    worker_id: &str,
+    error: &str,
+    attempt: i64,
+) -> rusqlite::Result<i64> {
+    in_savepoint(conn, "honker_fail", || {
+        fail_inner(conn, job_id, worker_id, error, Some(attempt))
+    })
+}
+
+const FAIL_SQL: [&str; 2] = [
+    "DELETE FROM _honker_live
+     WHERE id = ?1 AND worker_id = ?2
+       AND claim_expires_at >= unixepoch()
+     RETURNING id, queue, payload, priority, run_at, max_attempts,
+               attempts, created_at",
+    "DELETE FROM _honker_live
+     WHERE id = ?1 AND worker_id = ?2 AND attempts = ?3
+       AND state = 'processing'
+     RETURNING id, queue, payload, priority, run_at, max_attempts,
+               attempts, created_at",
+];
 
 fn fail_inner(
     conn: &Connection,
     job_id: i64,
     worker_id: &str,
     error: &str,
+    attempt: Option<i64>,
 ) -> rusqlite::Result<i64> {
-    #[allow(clippy::type_complexity)]
-    let row: Option<(i64, String, String, i64, i64, i64, i64, i64)> = conn
-        .query_row(
-            "DELETE FROM _honker_live
-             WHERE id = ?1 AND worker_id = ?2
-               AND claim_expires_at >= unixepoch()
-             RETURNING id, queue, payload, priority, run_at, max_attempts,
-                       attempts, created_at",
-            rusqlite::params![job_id, worker_id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((id, queue, payload, priority, run_at, max_attempts, attempts, created_at)) = row
-    else {
+    let row = {
+        let mut stmt = conn.prepare_cached(FAIL_SQL[usize::from(attempt.is_some())])?;
+        bind_guard(&mut stmt, job_id, worker_id, attempt)?;
+        let mut rows = stmt.raw_query();
+        match rows.next()? {
+            Some(r) => Some(DeadRow::from_row(r)?),
+            None => None,
+        }
+    };
+    let Some(row) = row else {
         return Ok(0);
     };
-    conn.execute(
-        "INSERT INTO _honker_dead
-           (id, queue, payload, priority, run_at, max_attempts,
-            attempts, last_error, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        rusqlite::params![
-            id,
-            queue,
-            payload,
-            priority,
-            run_at,
-            max_attempts,
-            attempts,
-            error,
-            created_at
-        ],
-    )?;
+    row.insert_dead(conn, error)?;
     Ok(1)
 }
 
@@ -1434,6 +1630,8 @@ pub fn get_job(conn: &Connection, job_id: i64) -> rusqlite::Result<String> {
 /// does not start a new attempt. Refreshing it would make a
 /// long-running job look like it just began, which is exactly the
 /// blind spot `claimed_at` exists to fix.
+///
+/// Unfenced: worker_id plus the lease. See [`heartbeat_fenced`].
 pub fn heartbeat(
     conn: &Connection,
     job_id: i64,
@@ -1449,6 +1647,34 @@ pub fn heartbeat(
          WHERE id = ?1 AND worker_id = ?2 AND state = 'processing'
            AND claim_expires_at >= unixepoch()",
         rusqlite::params![job_id, worker_id, extend_s],
+    )?;
+    Ok(updated as i64)
+}
+
+/// Fenced [`heartbeat`]: sets `claim_expires_at = now + extend_s` if
+/// the row is still this claim (`id`, `worker_id`, `attempts =
+/// attempt`, `state = 'processing'`). Returns 1 if extended, else 0.
+///
+/// No lease check, on purpose. The unfenced form needs one because
+/// worker_id alone cannot tell a reclaimer from the stale holder. The
+/// token can: a reclaim bumps `attempts`, so a stale heartbeat matches
+/// nothing. A heartbeat after the lease lapsed but before anyone
+/// reclaimed the job revives the lease, which is correct: the holder
+/// is still working and nobody else has started. `claimed_at` is left
+/// alone, as in [`heartbeat`].
+pub fn heartbeat_fenced(
+    conn: &Connection,
+    job_id: i64,
+    worker_id: &str,
+    extend_s: i64,
+    attempt: i64,
+) -> rusqlite::Result<i64> {
+    let updated = conn.execute(
+        "UPDATE _honker_live
+         SET claim_expires_at = unixepoch() + ?3
+         WHERE id = ?1 AND worker_id = ?2 AND attempts = ?4
+           AND state = 'processing'",
+        rusqlite::params![job_id, worker_id, extend_s, attempt],
     )?;
     Ok(updated as i64)
 }

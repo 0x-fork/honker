@@ -1,5 +1,33 @@
 # CHANGELOG
 
+## Unreleased — fenced ack/retry/fail/heartbeat (issue #176)
+
+- New SQL arities that take the claim's `attempts` as a fencing token:
+  `honker_ack(id, worker_id, attempt)`, `honker_retry(id, worker_id,
+  delay_s, error, attempt)`, `honker_fail(id, worker_id, error, attempt)`
+  and `honker_heartbeat(id, worker_id, extend_s, attempt)`.
+  `honker_ack_batch` also accepts `[id, attempt]` pairs; plain ids keep the
+  old guard, and both kinds may be mixed in one call. Rust:
+  `ack_fenced`, `retry_fenced`, `fail_fenced`, `heartbeat_fenced`.
+- The fenced guard is `id + worker_id + attempts = attempt + state =
+  'processing'`, with no lease check. A reclaim bumps `attempts`, and
+  dead-letter, expiry and cancel remove the row. So a stale handler that
+  shares the new holder's worker id gets 0, and a late handler whose job
+  nobody reclaimed still completes. A fenced heartbeat sets
+  `claim_expires_at = now + extend_s`, reviving a lapsed lease that nobody
+  reclaimed.
+- Fenced retry stays write-first, like the unfenced one: one guarded
+  UPDATE for the pending branch, and a guarded `DELETE ... RETURNING` plus
+  the `_honker_dead` insert in one savepoint for the dead branch.
+- The existing arities are unchanged and are now documented as unfenced.
+  No binding changes here: bindings adopt the fenced forms by passing
+  `job.attempts`, so `job.ack()` and friends keep their signatures.
+- Proof: `honker-core/src/fencing_tests.rs`; separate-process tests through
+  the loadable extension in `tests/test_extension_interop.py`; and the
+  lifecycle torture test now drives the fenced forms, so its fencing
+  invariant passes and is no longer xfail. `HONKER_TORTURE_FENCED=0` still
+  runs the legacy forms, where that invariant is xfail.
+
 ## Unreleased — queue-scoped cancel in core (issue #134)
 
 - `honker_cancel(queue, job_id)` joins the existing `honker_cancel(job_id)`.

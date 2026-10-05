@@ -22,6 +22,10 @@ Knobs (environment):
   worker id. Default ``1``: two pairs of live processes share an id,
   which models a restarted worker whose old incarnation is still
   finishing a stalled handler.
+* ``HONKER_TORTURE_FENCED``: ``0`` makes handlers call the legacy
+  unfenced ``honker_ack(id, worker)`` etc. instead of the fenced
+  ``honker_ack(id, worker, attempt)`` forms. With shared worker ids the
+  fencing invariant then fails (#176) and is marked xfail.
 * ``HONKER_EXTENSION_PATH``: the extension to load. Default
   ``target/release/libhonker_ext.{dylib,so}``.
 
@@ -29,10 +33,11 @@ This test fails, rather than skips, when the extension is missing or
 the interpreter's sqlite3 cannot load extensions. It only skips on
 Windows, which has no SIGKILL.
 
-Two invariants fail on main today and are marked xfail with their
-issues: fencing (2, same worker id stale ack) and stuck expired rows
-(5, an in-flight job that expires is never swept). Remove a marker when
-its fix lands; the test will then guard the fix.
+One invariant fails on main today and is marked xfail with its issue:
+stuck expired rows (5, an in-flight job that expires is never swept).
+Remove the marker when its fix lands; the test will then guard the fix.
+Fencing (2) passes with the fenced forms (#176) and is only xfail when
+``HONKER_TORTURE_FENCED=0`` drives the legacy unfenced forms.
 """
 
 import os
@@ -51,20 +56,23 @@ PROCS = int(os.environ.get("HONKER_TORTURE_PROCS", "6"))
 # the killed process's id). Used to isolate mutations from the known
 # same-id fencing bug.
 SHARED_IDS = os.environ.get("HONKER_TORTURE_SHARED_IDS", "1") != "0"
+# 0 drives the legacy unfenced ack/retry/fail/heartbeat arities.
+FENCED = os.environ.get("HONKER_TORTURE_FENCED", "1") != "0"
 
 FENCING_ISSUE = "https://github.com/russellromney/honker/issues/176"
 STUCK_EXPIRED_ISSUE = "https://github.com/russellromney/honker/issues/177"
 
 KNOWN_BUGS = {
-    "2_fencing": (
-        "main: ack/retry/fail/heartbeat check worker_id + lease, not the attempt, so a "
-        "stale handler with the same worker id acts on the new attempt. " + FENCING_ISSUE
-    ),
     "5_expiry": (
         "main: sweep_expired ignores processing rows and claim skips expired rows, so an "
         "in-flight job that expires stays live forever. " + STUCK_EXPIRED_ISSUE
     ),
 }
+if not FENCED:
+    KNOWN_BUGS["2_fencing"] = (
+        "legacy unfenced ack/retry/fail/heartbeat check worker_id + lease, not the attempt, "
+        "so a stale handler with the same worker id acts on the new attempt. " + FENCING_ISSUE
+    )
 
 pytestmark = [
     # ~30 s per seed, so it is kept out of the default `-n auto` run and
@@ -102,9 +110,9 @@ def report(request, tmp_path_factory):
     if seed not in _RUNS:
         ext = _require_extension()
         workdir = str(tmp_path_factory.mktemp(f"torture-seed{seed}"))
-        res = lt.run_torture(workdir, ext, seed, SECONDS, PROCS, SHARED_IDS)
+        res = lt.run_torture(workdir, ext, seed, SECONDS, PROCS, SHARED_IDS, FENCED)
         rep = lt.check(res)
-        print(f"\n[torture seed={seed} seconds={SECONDS}] workdir={workdir}\n{rep.stats}")
+        print(f"\n[torture seed={seed} seconds={SECONDS} fenced={FENCED}] workdir={workdir}\n{rep.stats}")
         _RUNS[seed] = rep
     return _RUNS[seed]
 

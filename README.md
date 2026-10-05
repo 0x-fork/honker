@@ -183,6 +183,40 @@ worker can claim jobs written by SQL, Node, Ruby, Go, or any other
 binding.
 
 
+### Fenced completion (attempt token)
+
+`honker_claim_batch` returns each job's `attempts`. That value is the
+claim's fencing token: pass it as the last argument to finish the job.
+
+```sql
+SELECT honker_ack(7, 'worker-1', 3);                        -- 1 = done
+SELECT honker_retry(7, 'worker-1', 30, 'timeout', 3);       -- 1 = retried or dead
+SELECT honker_fail(7, 'worker-1', 'rejected', 3);           -- 1 = moved to dead
+SELECT honker_heartbeat(7, 'worker-1', 300, 3);             -- 1 = lease extended
+SELECT honker_ack_batch('[[7,3],[8,1]]', 'worker-1');       -- [id, attempt] pairs
+```
+
+A fenced call acts only if the row is still that claim: same id, worker
+id and `attempts`, and still `processing`. It does not check the lease.
+A reclaim increases `attempts`, and dead-lettering, expiry and cancel
+remove the row, so:
+
+- A stale handler gets 0, even when a restarted worker with the same
+  worker id has reclaimed the job.
+- A handler that overran its lease still completes if nobody reclaimed
+  the job. The job does not run again. A fenced heartbeat in that state
+  sets `claim_expires_at = now + extend_s` again.
+
+The shorter forms (`honker_ack(id, worker_id)`, `honker_retry(id,
+worker_id, delay_s, error)`, `honker_fail(id, worker_id, error)`,
+`honker_heartbeat(id, worker_id, extend_s)`, and plain ids in
+`honker_ack_batch`) are unchanged and **unfenced**. They check the worker
+id and an unexpired lease. A stale handler that shares the new holder's
+worker id passes that check and can ack, retry or fail the newer attempt
+(issue #176). Use the fenced forms when worker ids can repeat, for
+example a worker restarted with a fixed id while its old process still
+runs.
+
 ### SQL call context
 
 `honker_claim_batch`, `honker_fail`, `honker_sweep_expired`, and a

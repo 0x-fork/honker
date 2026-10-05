@@ -9,6 +9,7 @@ while Python DELETEd them. Both now share
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 
 import pytest
@@ -23,7 +24,13 @@ _CANDIDATES = [
     os.path.join(REPO_ROOT, "target", "release", "libhonker_ext.dylib"),
     os.path.join(REPO_ROOT, "target", "release", "libhonker_ext.so"),
 ]
-_EXT_PATH = next((p for p in _CANDIDATES if os.path.exists(p)), None)
+# HONKER_EXTENSION_PATH wins, as in tests/lifecycle_torture.py, so a
+# build in a separate CARGO_TARGET_DIR can be tested.
+_EXT_PATH = os.environ.get("HONKER_EXTENSION_PATH") or next(
+    (p for p in _CANDIDATES if os.path.exists(p)), None
+)
+if _EXT_PATH is not None and not os.path.exists(_EXT_PATH):
+    _EXT_PATH = None
 
 _SKIP_REASON = (
     "honker-extension .dylib/.so not found under target/release — "
@@ -967,3 +974,165 @@ def test_extension_capability_probe_detects_the_two_arg_cancel(ext_db_path):
     with pytest.raises(sqlite3.OperationalError, match="wrong number of arguments"):
         old.execute("SELECT honker_cancel('emails', 1)")
     old.close()
+
+
+# --- fencing token (issue #176) --------------------------------------
+#
+# The claim's `attempts` is a fencing token. The fenced forms
+# honker_ack(id, worker, attempt), honker_retry(id, worker, delay,
+# error, attempt), honker_fail(id, worker, error, attempt) and
+# honker_heartbeat(id, worker, extend, attempt) only act on the claim
+# with that token. The stale handler and the restarted worker run in
+# separate OS processes here, sharing one worker id. The lease lapse is
+# forced by writing claim_expires_at into the past, so nothing sleeps.
+
+_PEER = r"""
+import json, sqlite3, sys
+ext, db, stmts = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+conn = sqlite3.connect(db, isolation_level=None, timeout=10)
+conn.enable_load_extension(True)
+conn.load_extension(ext)
+conn.execute("PRAGMA busy_timeout = 10000")
+print(json.dumps([conn.execute(sql, args).fetchone()[0] for sql, args in stmts]))
+"""
+
+
+def _in_other_process(db_path, *stmts):
+    """Run each (sql, args) in a fresh OS process; return the scalars."""
+    out = subprocess.run(
+        [sys.executable, "-c", _PEER, _EXT_PATH, db_path, json.dumps(stmts)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return json.loads(out.stdout)
+
+
+def _lapse(conn, job_id):
+    conn.execute(
+        "UPDATE _honker_live SET claim_expires_at = unixepoch() - 5 WHERE id = ?",
+        [job_id],
+    )
+
+
+def _row(conn, job_id):
+    return conn.execute(
+        "SELECT state, worker_id, attempts, claim_expires_at, claimed_at, run_at "
+        "FROM _honker_live WHERE id = ?",
+        [job_id],
+    ).fetchone()
+
+
+_STALE_CALLS = {
+    "ack": "SELECT honker_ack(?, 'w', 1)",
+    "retry": "SELECT honker_retry(?, 'w', 0, 'stale', 1)",
+    "fail": "SELECT honker_fail(?, 'w', 'stale', 1)",
+    "heartbeat": "SELECT honker_heartbeat(?, 'w', 300, 1)",
+}
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+@pytest.mark.parametrize("op", sorted(_STALE_CALLS))
+def test_extension_fenced_stale_same_worker_is_refused(ext_db_path, op):
+    """Worker 'w' claims attempt 1 and stalls past its lease. Its
+    restarted self, also 'w', in another process reclaims: attempt 2.
+    The stale handler's fenced call returns 0 and the new owner's row is
+    untouched; the new owner then finishes with its own token."""
+    conn = _open_ext(ext_db_path)
+    conn.isolation_level = None
+    jid = conn.execute(
+        "SELECT honker_enqueue('fence', '{}', NULL, NULL, 0, 5, NULL)"
+    ).fetchone()[0]
+    first = json.loads(
+        conn.execute("SELECT honker_claim_batch('fence', 'w', 1, 60)").fetchone()[0]
+    )
+    assert [(j["id"], j["attempts"]) for j in first] == [(jid, 1)]
+    _lapse(conn, jid)
+
+    (reclaimed,) = _in_other_process(
+        ext_db_path, ("SELECT honker_claim_batch('fence', 'w', 1, 60)", [])
+    )
+    assert [(j["id"], j["attempts"]) for j in json.loads(reclaimed)] == [(jid, 2)]
+    owner_row = _row(conn, jid)
+    assert owner_row[:3] == ("processing", "w", 2)
+
+    assert conn.execute(_STALE_CALLS[op], [jid]).fetchone()[0] == 0
+    assert _row(conn, jid) == owner_row
+    assert conn.execute(
+        "SELECT count(*) FROM _honker_dead WHERE id = ?", [jid]
+    ).fetchone()[0] == 0
+
+    assert _in_other_process(
+        ext_db_path, ("SELECT honker_ack(?, 'w', 2)", [jid])
+    ) == [1]
+    assert _row(conn, jid) is None
+    conn.close()
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_extension_unfenced_stale_same_worker_ack_still_succeeds(ext_db_path):
+    """The legacy 2-arg ack is unchanged and unfenced: it checks
+    worker_id and the lease, which the reclaim refreshed, so the stale
+    handler's ack deletes the new attempt. This is why the fenced forms
+    exist; bindings move to them by passing job.attempts."""
+    conn = _open_ext(ext_db_path)
+    conn.isolation_level = None
+    jid = conn.execute(
+        "SELECT honker_enqueue('fence', '{}', NULL, NULL, 0, 5, NULL)"
+    ).fetchone()[0]
+    conn.execute("SELECT honker_claim_batch('fence', 'w', 1, 60)")
+    _lapse(conn, jid)
+    _in_other_process(ext_db_path, ("SELECT honker_claim_batch('fence', 'w', 1, 60)", []))
+    assert conn.execute("SELECT honker_ack(?, 'w')", [jid]).fetchone()[0] == 1
+    conn.close()
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_extension_fenced_late_but_unreclaimed_ack_succeeds(ext_db_path):
+    """A handler that overran its lease while nobody reclaimed the job
+    still completes with its token, and the job does not run again.
+    The fenced form has no lease check: the token alone decides."""
+    conn = _open_ext(ext_db_path)
+    conn.isolation_level = None
+    jid = conn.execute(
+        "SELECT honker_enqueue('fence', '{}', NULL, NULL, 0, 5, NULL)"
+    ).fetchone()[0]
+    conn.execute("SELECT honker_claim_batch('fence', 'w', 1, 60)")
+    _lapse(conn, jid)
+
+    # The unfenced form needs a live lease and refuses.
+    assert conn.execute("SELECT honker_ack(?, 'w')", [jid]).fetchone()[0] == 0
+    assert _in_other_process(
+        ext_db_path, ("SELECT honker_ack(?, 'w', 1)", [jid])
+    ) == [1]
+    assert _row(conn, jid) is None
+    assert conn.execute("SELECT count(*) FROM _honker_dead").fetchone()[0] == 0
+    (again,) = _in_other_process(
+        ext_db_path, ("SELECT honker_claim_batch('fence', 'w2', 10, 60)", [])
+    )
+    assert json.loads(again) == []
+    conn.close()
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_extension_fenced_ack_batch_takes_id_attempt_pairs(ext_db_path):
+    """honker_ack_batch: [id, attempt] pairs are fenced, plain ids keep
+    the legacy guard."""
+    conn = _open_ext(ext_db_path)
+    conn.isolation_level = None
+    ids = [
+        conn.execute(
+            "SELECT honker_enqueue('fence', '{}', NULL, NULL, 0, 5, NULL)"
+        ).fetchone()[0]
+        for _ in range(3)
+    ]
+    jobs = json.loads(
+        conn.execute("SELECT honker_claim_batch('fence', 'w', 3, 60)").fetchone()[0]
+    )
+    assert sorted(j["attempts"] for j in jobs) == [1, 1, 1]
+    a, b, c = ids
+    pairs = json.dumps([[a, 2], [b, 1], c])
+    assert conn.execute("SELECT honker_ack_batch(?, 'w')", [pairs]).fetchone()[0] == 2
+    assert _row(conn, a)[:3] == ("processing", "w", 1)
+    assert _row(conn, b) is None and _row(conn, c) is None

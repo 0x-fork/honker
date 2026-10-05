@@ -35,6 +35,8 @@
 //! objects — stays in the respective binding crate.
 
 pub mod cron;
+#[cfg(test)]
+mod fencing_tests;
 mod honker_ops;
 #[cfg(feature = "kernel-watcher")]
 mod kernel_watcher;
