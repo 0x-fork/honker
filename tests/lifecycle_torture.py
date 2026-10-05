@@ -4,7 +4,10 @@ This module has three parts:
 
 * ``worker_main``: one OS process. It loads the raw loadable extension
   through stdlib ``sqlite3`` and runs a seeded random loop of enqueue,
-  claim, ack, retry, fail, heartbeat, stall-past-the-lease and cancel.
+  claim, ack, retry, fail, heartbeat, stall-past-the-lease, abandon (the
+  handler drops the job without a call, like a crashed handler thread)
+  and cancel. About a third of the jobs expire 1-3 s after enqueue, so
+  abandoned, stalled and SIGKILLed claims often expire in flight.
   Every call is written to a per-process JSONL ledger twice: a ``pre``
   record before the call and a ``post`` record with the return value or
   error after it. A process SIGKILLed mid-call therefore leaves a
@@ -144,7 +147,8 @@ def _enqueue(conn, rng, tag, n):
     expires = rng.randint(1, 3) if rng.random() < 0.35 else None
     max_attempts = rng.randint(1, 4)
     priority = rng.randint(0, 1)
-    payload = json.dumps({"tok": tok})
+    # "exp" lets the handler know the job expires (see _handle).
+    payload = json.dumps({"tok": tok, "exp": expires})
 
     def do():
         conn.execute("BEGIN IMMEDIATE")
@@ -179,6 +183,7 @@ def _claim(conn, queue, wid, n, lease):
                     "claimed_at": j["claimed_at"],
                     "cexp": j["claim_expires_at"],
                     "tok": json.loads(j["payload"]).get("tok"),
+                    "exp": json.loads(j["payload"]).get("exp"),
                 }
             )
         return {"jobs": jobs}
@@ -218,6 +223,13 @@ def _handle(conn, led, rng, wid, job, fenced):
     jid, att = job["id"], job["att"]
     # A little "work" so SIGKILLs often land mid-handler.
     time.sleep(rng.uniform(0.0, 0.15))
+    # The handler dies without a word, and the process lives on. The
+    # lease lapses with nobody to finish the job; if it also expires
+    # before a reclaim, only the expiry rule can end it (#177). Jobs that
+    # expire are abandoned more often, so every run sees that case.
+    if rng.random() < (0.35 if job.get("exp") else 0.05):
+        led.write({"ev": "abandon", "id": jid, "att": att})
+        return
     r = rng.random()
     if r < 0.28:
         plan = ["ack"]
@@ -455,7 +467,8 @@ def _quiesce_and_drain(conn, workdir, ledgers):
                 )
         future = _scalar(
             conn,
-            "SELECT count(*) FROM _honker_live WHERE state = 'pending' AND run_at > unixepoch()",
+            "SELECT count(*) FROM _honker_live "
+            "WHERE state IN ('pending', 'scheduled') AND run_at > unixepoch()",
         )
         if got == 0 and future == 0:
             break
@@ -623,7 +636,7 @@ def check(result: RunResult) -> Report:
             V.append(Violation("1_one_end_state", jid, "two end states: " + "; ".join(ends)))
         elif not ends and not maybe:
             V.append(Violation("1_one_end_state", jid, "job vanished: no ack, no cancel, not dead, not live"))
-        if jid in live and live[jid]["state"] not in ("pending", "processing"):
+        if jid in live and live[jid]["state"] not in ("scheduled", "pending", "processing"):
             V.append(Violation("1_one_end_state", jid, f"live in invalid state {live[jid]['state']!r}"))
 
     # 2. Fencing.
@@ -765,8 +778,29 @@ def check(result: RunResult) -> Report:
         if open_jobs or inside_call:
             mid_handler += 1
 
+    # Jobs that expired in flight: after their last claim nothing ended
+    # or re-queued them (no successful ack/retry/fail/cancel), and they
+    # are past expires_at at the end. With the fix they are dead
+    # ('expired'); a stuck one is still live (also a 5_expiry violation).
+    expired_in_flight = 0
+    for jid, cl in claims.items():
+        last = max(c["t0"] for c in cl)
+        settled = any(
+            c["ret"] == 1 and c["op"] in ("ack", "retry", "fail") and c["t0"] >= last
+            for c in lifecycle[jid]
+        ) or any(c["ret"] == 1 for c in cancels[jid])
+        if settled:
+            continue
+        exp, _ = expires_of(jid)
+        if (jid in dead and dead[jid]["last_error"] == "expired") or (
+            jid in live and exp is not None and exp <= now
+        ):
+            expired_in_flight += 1
+
     stats = {
         "jobs": len(jobs),
+        "expired_in_flight": expired_in_flight,
+        "abandoned": sum(1 for r in recs if r.get("ev") == "abandon"),
         "enqueued": len(enq),
         "claims": sum(len(v) for v in claims.values()),
         "acks_ok": sum(1 for c in calls if c["op"] == "ack" and c["ret"] == 1),

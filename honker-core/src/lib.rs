@@ -34,6 +34,8 @@
 //! entry-point symbols, row-materialization into Python dicts or JS
 //! objects — stays in the respective binding crate.
 
+#[cfg(test)]
+mod claim_v2_tests;
 pub mod cron;
 #[cfg(test)]
 mod fencing_tests;
@@ -352,9 +354,25 @@ pub fn attach_notify(conn: &Connection) -> Result<(), Error> {
 ///
 /// Schema:
 ///
-///   * `_honker_live`  — pending + processing jobs. Partial index
-///     `_honker_live_claim` restricts to those two states so dead-row
-///     history never slows down the claim hot path.
+///   * `_honker_live`  — live jobs. `state` is one of:
+///       - `scheduled`: `run_at` is in the future
+///       - `pending`: due, waiting for a worker
+///       - `processing`: claimed. A lapsed lease stays `processing`
+///         until a claim takes it or moves it to `_honker_dead`.
+///
+///     Indexes, each partial so a claim only reads rows it can act on:
+///       - `_honker_live_ready (queue, priority DESC, run_at, id)
+///         WHERE state='pending'`: the claim order. Future and in-flight
+///         rows are not in it, so a claim stops after `n` rows.
+///       - `_honker_live_scheduled (queue, run_at) WHERE
+///         state='scheduled'`: promotion when `run_at` passes.
+///       - `_honker_live_expiry (queue, expires_at) WHERE expires_at IS
+///         NOT NULL`: expiry.
+///       - `_honker_live_processing_deadline (queue, claim_expires_at)
+///         WHERE state='processing'`: lapsed leases.
+///
+///     Databases from before the `scheduled` state are migrated by
+///     [`bootstrap_honker_schema`].
 ///   * `_honker_dead`  — terminal rows (retry-exhausted or explicitly
 ///     failed). Never scanned by the claim path; retention policy is
 ///     the user's problem.
@@ -378,12 +396,15 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
       expires_at INTEGER,
       claimed_at INTEGER
     );
-    CREATE INDEX IF NOT EXISTS _honker_live_claim
+    CREATE INDEX IF NOT EXISTS _honker_live_ready
       ON _honker_live(queue, priority DESC, run_at, id)
-      WHERE state IN ('pending', 'processing');
-    CREATE INDEX IF NOT EXISTS _honker_live_pending_deadline
-      ON _honker_live(queue, run_at)
       WHERE state = 'pending';
+    CREATE INDEX IF NOT EXISTS _honker_live_scheduled
+      ON _honker_live(queue, run_at)
+      WHERE state = 'scheduled';
+    CREATE INDEX IF NOT EXISTS _honker_live_expiry
+      ON _honker_live(queue, expires_at)
+      WHERE expires_at IS NOT NULL;
     CREATE INDEX IF NOT EXISTS _honker_live_processing_deadline
       ON _honker_live(queue, claim_expires_at)
       WHERE state = 'processing';
@@ -519,7 +540,72 @@ pub fn bootstrap_honker_schema(conn: &Connection) -> Result<(), Error> {
             Err(e) => return Err(e.into()),
         }
     }
+    migrate_claim_v2(conn)?;
     Ok(())
+}
+
+/// The index every pre-`scheduled` database has. Its presence is the
+/// migration marker for [`migrate_claim_v2`].
+const LEGACY_CLAIM_INDEX: &str = "_honker_live_claim";
+
+fn index_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+        [name],
+        |r| r.get(0),
+    )
+}
+
+/// Migrate a database written before the `scheduled` state. Runs once:
+/// the last step drops `_honker_live_claim`, which is the marker.
+///
+/// 1. Future `pending` rows become `scheduled`. Older builds wrote every
+///    job as `pending`; the claim's ready index must not hold future
+///    rows.
+/// 2. `pending`/`scheduled` rows with no attempts left move to
+///    `_honker_dead` with `'max attempts exceeded'`. The claim no longer
+///    sweeps the whole due backlog for them (older builds did that on
+///    every claim); only lapsed leases are swept.
+/// 3. Drop `_honker_live_claim` and `_honker_live_pending_deadline`;
+///    the new indexes already exist (`BOOTSTRAP_HONKER_SQL`).
+///
+/// Safe when several processes bootstrap at once. The first statement
+/// in the savepoint is a write, so it takes the write lock on the
+/// newest snapshot and waits on `busy_timeout` like any write; the
+/// marker is then checked again under the lock. A process that lost
+/// the race sees the marker gone and does nothing. The steps commit
+/// together or not at all.
+///
+/// Workers from an older build must be stopped first: they still write
+/// future jobs as `pending` and never promote `scheduled` rows.
+fn migrate_claim_v2(conn: &Connection) -> rusqlite::Result<()> {
+    if !index_exists(conn, LEGACY_CLAIM_INDEX)? {
+        return Ok(());
+    }
+    honker_ops::in_savepoint(conn, "honker_bootstrap", || {
+        // Take the write lock before reading anything (matches no rows).
+        conn.execute("UPDATE _honker_live SET state = state WHERE 0", [])?;
+        if !index_exists(conn, LEGACY_CLAIM_INDEX)? {
+            return Ok(());
+        }
+        conn.execute_batch(
+            "UPDATE _honker_live SET state = 'scheduled'
+              WHERE state = 'pending' AND run_at > unixepoch();
+             INSERT INTO _honker_dead
+               (id, queue, payload, priority, run_at, max_attempts,
+                attempts, last_error, created_at)
+             SELECT id, queue, payload, priority, run_at, max_attempts,
+                    attempts, 'max attempts exceeded', created_at
+               FROM _honker_live
+              WHERE state IN ('pending', 'scheduled')
+                AND attempts >= max_attempts;
+             DELETE FROM _honker_live
+              WHERE state IN ('pending', 'scheduled')
+                AND attempts >= max_attempts;
+             DROP INDEX _honker_live_claim;
+             DROP INDEX IF EXISTS _honker_live_pending_deadline;",
+        )
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -2480,16 +2566,27 @@ while True:
         assert!(dead_cols.contains(&"max_attempts".to_string()));
         assert!(dead_cols.contains(&"created_at".to_string()));
 
-        // Partial index present.
-        let idx: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type='index' AND name='_honker_live_claim'",
-                [],
-                |r| r.get(0),
+        // The claim-v2 partial indexes, and none of the legacy ones.
+        let idx: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='index' AND tbl_name='_honker_live'
+                   AND name LIKE '_honker_live_%' ORDER BY name",
             )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(idx, 1);
+        assert_eq!(
+            idx,
+            vec![
+                "_honker_live_expiry",
+                "_honker_live_processing_deadline",
+                "_honker_live_ready",
+                "_honker_live_scheduled",
+            ]
+        );
 
         // _honker_locks table present for db.lock() support.
         let locks_cols: Vec<String> = conn

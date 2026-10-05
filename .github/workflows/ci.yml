@@ -807,6 +807,36 @@ jobs:
         run: |
           python3 scripts/proof/claimed-at-upgrade.py --legacy-extension "$RUNNER_TEMP/honker-legacy/libhonker_ext.so" --extension "$RUNNER_TEMP/honker-current/libhonker_ext.so"
 
+  claim-v2-upgrade:
+    name: upgrade · legacy queue rows into claim v2
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build current and pinned pre-claim-v2 extensions
+        env:
+          # Last main before the `scheduled` state (#179 merged).
+          LEGACY_COMMIT: 28587ee49223b3c04dd793503b2836fb7c29934e
+        run: |
+          cargo build --release --locked -p honker-extension
+          mkdir -p "$RUNNER_TEMP/honker-current" "$RUNNER_TEMP/honker-legacy-source" "$RUNNER_TEMP/honker-legacy"
+          cp target/release/libhonker_ext.so "$RUNNER_TEMP/honker-current/"
+          git fetch --no-tags --depth=1 origin "$LEGACY_COMMIT"
+          git archive "$LEGACY_COMMIT" | tar -x -C "$RUNNER_TEMP/honker-legacy-source"
+          # A separate target dir: a shared one can reuse the current build as legacy.
+          CARGO_TARGET_DIR="$RUNNER_TEMP/honker-legacy-target" cargo build --release --locked -p honker-extension --manifest-path "$RUNNER_TEMP/honker-legacy-source/Cargo.toml"
+          cp "$RUNNER_TEMP/honker-legacy-target/release/libhonker_ext.so" "$RUNNER_TEMP/honker-legacy/"
+      - name: Prove the migration and concurrent bootstrap
+        run: |
+          python3 scripts/proof/claim-v2-upgrade.py --legacy-extension "$RUNNER_TEMP/honker-legacy/libhonker_ext.so" --extension "$RUNNER_TEMP/honker-current/libhonker_ext.so"
+
   ci-ok:
     # THE required status check for everything in *this* workflow.
     #
@@ -842,6 +872,7 @@ jobs:
       - lint
       - rust
       - claimed-at-upgrade
+      - claim-v2-upgrade
       - perf-regression
       - wake-latency
       - python

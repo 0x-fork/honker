@@ -1,5 +1,54 @@
 # CHANGELOG
 
+## Unreleased — claim v2: `scheduled` state, eager expiry (BREAKING; issue #177)
+
+**BREAKING: new job state value. Stop all workers to upgrade.** Old
+builds never claim a `scheduled` job and write future jobs as `pending`.
+Stop every Honker process on the database, upgrade all of them, run the
+normal bootstrap, then resume (README, "Upgrading to the `scheduled`
+state").
+
+- New state `scheduled` for jobs whose `run_at` is in the future.
+  `honker_enqueue` writes it for a future `run_at`, and `honker_retry`
+  writes it for `delay_s > 0`; otherwise `pending`. `honker_get_job`
+  reports it, and both `honker_cancel` arities accept it.
+- `honker_claim_batch` reads the clock once and binds it into every
+  step. Before claiming, it does three steps, each capped at 1000 rows
+  (`CLAIM_HOUSEKEEPING_LIMIT`): promote due `scheduled` rows, move expired
+  jobs to `_honker_dead`, and move lapsed leases with no attempts left to
+  `_honker_dead` with `'max attempts exceeded'`.
+- Fix #177: an expired job whose lease lapsed is moved to `_honker_dead`
+  with `'expired'` by the next claim or by `honker_sweep_expired`.
+  Before, a job that expired while in flight stayed `processing` forever.
+  A job with a valid lease is left to its worker.
+- A lapsed lease stays `processing` until it is reclaimed, so a fenced
+  late ack (#176) still completes it until then.
+- Claim latency no longer grows with backlog. The claim reads the new
+  ready index (`state = 'pending'`) plus lapsed leases. Measured through
+  the extension, p50 per claim with 1k vs 50k rows of backlog: due
+  0.74/0.73 ms, in flight 0.82/0.75 ms, delayed higher-priority
+  1.06/0.71 ms, expired higher-priority 0.84/0.81 ms. Main before this
+  change: 16–26 ms at 50k.
+- Indexes: new `_honker_live_ready`, `_honker_live_scheduled` and
+  `_honker_live_expiry`; `_honker_live_claim` and
+  `_honker_live_pending_deadline` are dropped.
+- `max_attempts` must be at least 1. `honker_enqueue`,
+  `honker_scheduler_register` and `honker_scheduler_update` return an
+  error for 0 or negative values. Before, enqueue accepted them (the job
+  was dead on its first claim) and the scheduler clamped them to 1.
+- `honker_queue_next_claim_at` accounts for `scheduled` rows and leases;
+  it no longer reports exhausted lapsed leases.
+- Bootstrap migrates an older database once, in one savepoint, and is
+  safe when several processes bootstrap at once: future `pending` rows
+  become `scheduled`, exhausted `pending` rows move to `_honker_dead`, and
+  the old indexes are dropped.
+- Proof: `honker-core/src/claim_v2_tests.rs`; separate-process tests
+  through the extension in `tests/test_extension_interop.py`; a claim
+  latency floor in `tests/test_performance_floors.py`;
+  `scripts/proof/claim-v2-upgrade.py` (CI job `claim-v2-upgrade`) against
+  a real 28587ee build, including eight processes bootstrapping at once;
+  the lifecycle torture test's expiry invariant is no longer xfail.
+
 ## Unreleased — fenced ack/retry/fail/heartbeat (issue #176)
 
 - New SQL arities that take the claim's `attempts` as a fencing token:

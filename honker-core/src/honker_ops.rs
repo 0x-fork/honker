@@ -120,7 +120,7 @@ fn to_sql_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
 ///     join that transaction.
 ///   * A panicking `body` unwinds past every one of those paths, so the
 ///     undo also hangs off a drop guard. See [`UnwindUndo`].
-fn in_savepoint<T>(
+pub(crate) fn in_savepoint<T>(
     conn: &Connection,
     name: &str,
     body: impl FnOnce() -> rusqlite::Result<T>,
@@ -855,81 +855,173 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
 // Claim / ack
 // ---------------------------------------------------------------------
 
-/// Move claimable rows that have already exhausted `max_attempts` into
-/// `_honker_dead`. Without this, a worker that dies after the last
-/// allowed claim leaves the row reclaimable forever — every reclaim
-/// would bump `attempts` past `max_attempts` with no dead-letter path
-/// (dead-letter previously only ran inside `retry()`).
+/// Most rows one housekeeping step of [`claim_batch`] touches.
 ///
-/// "Claimable" here matches the reclaim predicate: pending+due or
-/// processing with an expired visibility timeout. In-flight claims
-/// that still hold a valid timeout are left alone so the holder can
-/// still ack / retry / fail.
-///
-/// Runs in a SAVEPOINT. The DELETE uses RETURNING and the rows are only
-/// decoded and re-inserted afterwards, so a decode or INSERT failure
-/// would otherwise leave the whole matching batch in neither table.
-/// Measured before the fix: one bad `attempts` value lost every row the
-/// DELETE matched (live=0, dead=0 for all of them). This one runs on
-/// every ordinary claim, so it is the most reachable of the five.
-fn dead_letter_exhausted_claimable(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
-    // Named after the public function: a call-context error shows this name.
-    in_savepoint(conn, "honker_claim_batch", || {
-        dead_letter_exhausted_claimable_inner(conn, queue)
-    })
-}
+/// Promotion, expiry and the exhausted-lease sweep each run inside the
+/// claim's write transaction. A backlog whose deadlines all pass at
+/// once (50k jobs scheduled for the same second, say) would otherwise
+/// be moved in one claim and stall every writer behind it. Anything
+/// left over is moved by the next claims; until then the claim's own
+/// filters keep it from being handed out wrongly.
+pub const CLAIM_HOUSEKEEPING_LIMIT: i64 = 1000;
 
-fn dead_letter_exhausted_claimable_inner(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
-    let mut select = conn.prepare_cached(
-        "DELETE FROM _honker_live
-         WHERE queue = ?1
-           AND attempts >= max_attempts
-           AND (expires_at IS NULL OR expires_at > unixepoch())
-           AND (
-             (state = 'pending' AND run_at <= unixepoch())
-             OR (state = 'processing' AND claim_expires_at < unixepoch())
-           )
-         RETURNING id, queue, payload, priority, run_at, max_attempts,
-                   attempts, created_at",
-    )?;
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(i64, String, String, i64, i64, i64, i64, i64)> = select
-        .query_map(rusqlite::params![queue], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    if rows.is_empty() {
+/// `scheduled → pending` for rows whose `run_at` has passed. Uses
+/// `_honker_live_scheduled (queue, run_at)`, so it only touches rows
+/// whose deadline passed.
+const PROMOTE_SQL: &str = "UPDATE _honker_live SET state = 'pending'
+     WHERE id IN (
+       SELECT id FROM _honker_live
+       WHERE queue = ?1 AND state = 'scheduled' AND run_at <= ?2
+       ORDER BY run_at, id
+       LIMIT ?3
+     )";
+
+/// Expired rows that nobody holds a valid lease on. A `processing` row
+/// whose lease lapsed is included: its holder is gone or late, and no
+/// claim can take it any more because it expired. Leaving it was
+/// issue #177 — it stayed `processing` forever. A `processing` row with
+/// a valid lease is left for its owner to finish. Uses
+/// `_honker_live_expiry (queue, expires_at)`.
+///
+/// `?3` is the row limit; [`sweep_expired`] passes -1 (no limit).
+const EXPIRE_IDS: &str = "SELECT id FROM _honker_live
+       WHERE queue = ?1 AND expires_at <= ?2
+         AND (state IN ('pending', 'scheduled')
+              OR (state = 'processing' AND claim_expires_at < ?2))
+       ORDER BY expires_at, id
+       LIMIT ?3";
+
+/// Lapsed leases that already used their attempt budget. Without this
+/// a worker that dies on the last allowed attempt leaves a row nobody
+/// may claim and nobody removes. Uses `_honker_live_processing_deadline
+/// (queue, claim_expires_at)`, so it only touches lapsed leases.
+///
+/// `pending` and `scheduled` rows cannot be exhausted: enqueue rejects
+/// `max_attempts < 1`, retry only re-queues while `attempts <
+/// max_attempts`, and bootstrap moves exhausted rows written by older
+/// builds when it migrates.
+const EXHAUSTED_IDS: &str = "SELECT id FROM _honker_live
+       WHERE queue = ?1 AND state = 'processing' AND claim_expires_at < ?2
+         AND attempts >= max_attempts
+       ORDER BY claim_expires_at, id
+       LIMIT ?3";
+
+/// The claim itself. Two arms:
+///
+/// * due `pending` rows, read in claim order straight off
+///   `_honker_live_ready (queue, priority DESC, run_at, id)`, which
+///   stops after `n` rows. `run_at <= now` keeps a future `pending` row
+///   written by an older build (or by raw SQL) from running early; with
+///   `INDEXED BY` it is a filter on the walk, not a different plan.
+/// * `processing` rows whose lease lapsed, via
+///   `_honker_live_processing_deadline`. Lapsed leases stay
+///   `processing` until a claim takes them, so the late holder's fenced
+///   ack still works until then.
+///
+/// SQLite does not allow ORDER BY/LIMIT on an arm of a compound
+/// SELECT, so the first arm is wrapped in its own subquery.
+const CLAIM_SQL: &str = "UPDATE _honker_live
+     SET state = 'processing',
+         worker_id = ?1,
+         claim_expires_at = ?5 + ?4,
+         claimed_at = ?5,
+         attempts = attempts + 1
+     WHERE id IN (
+       SELECT id FROM (
+         SELECT id, priority, run_at FROM (
+           SELECT id, priority, run_at
+           FROM _honker_live INDEXED BY _honker_live_ready
+           WHERE queue = ?2 AND state = 'pending' AND run_at <= ?5
+             AND attempts < max_attempts
+             AND (expires_at IS NULL OR expires_at > ?5)
+           ORDER BY priority DESC, run_at, id
+           LIMIT ?3
+         )
+         UNION ALL
+         SELECT id, priority, run_at FROM _honker_live
+         WHERE queue = ?2 AND state = 'processing' AND claim_expires_at < ?5
+           AND attempts < max_attempts
+           AND (expires_at IS NULL OR expires_at > ?5)
+       )
+       ORDER BY priority DESC, run_at, id
+       LIMIT ?3
+     )
+     RETURNING id, queue, payload, worker_id, attempts, claim_expires_at,
+               claimed_at";
+
+/// Move the rows `ids_sql` selects from `_honker_live` to
+/// `_honker_dead` with `last_error = error`. Returns how many moved.
+///
+/// Two set statements, no per-row round trip: `INSERT INTO _honker_dead
+/// SELECT ... WHERE id IN (ids)`, then `DELETE ... WHERE id IN (ids)`.
+/// They select the same rows because both bind the same `now` (`?2`),
+/// the order is total (`..., id`), and nothing else writes in between:
+/// the caller's savepoint holds the write lock. With `unixepoch()` in
+/// each statement instead, a row whose deadline fell between the two
+/// would be deleted without being copied — a lost job. The row counts
+/// are compared anyway, and a mismatch is an error, so the savepoint
+/// rolls both back instead of losing or duplicating a job.
+///
+/// Must run inside a savepoint (issue #133).
+fn move_to_dead(
+    conn: &Connection,
+    ids_sql: &str,
+    queue: &str,
+    now: i64,
+    limit: i64,
+    error: &str,
+) -> rusqlite::Result<i64> {
+    let copied = conn
+        .prepare_cached(&format!(
+            "INSERT INTO _honker_dead
+               (id, queue, payload, priority, run_at, max_attempts,
+                attempts, last_error, created_at, died_at)
+             SELECT id, queue, payload, priority, run_at, max_attempts,
+                    attempts, ?4, created_at, ?2
+               FROM _honker_live WHERE id IN ({ids_sql})"
+        ))?
+        .execute(rusqlite::params![queue, now, limit, error])?;
+    if copied == 0 {
         return Ok(0);
     }
-    let mut insert = conn.prepare_cached(
-        "INSERT INTO _honker_dead
-           (id, queue, payload, priority, run_at, max_attempts,
-            attempts, last_error, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'max attempts exceeded', ?8)",
-    )?;
-    let count = rows.len() as i64;
-    for r in rows {
-        insert.execute(rusqlite::params![r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7])?;
+    let deleted = conn
+        .prepare_cached(&format!("DELETE FROM _honker_live WHERE id IN ({ids_sql})"))?
+        .execute(rusqlite::params![queue, now, limit])?;
+    if deleted != copied {
+        return Err(to_sql_err(format!(
+            "honker: moving rows to _honker_dead copied {copied} but deleted \
+             {deleted}; rolled back"
+        )));
     }
-    Ok(count)
+    Ok(copied as i64)
 }
 
 /// Returns JSON text: `[{"id":1,"queue":"...","payload":"...","worker_id":"...","attempts":N,"claim_expires_at":T,"claimed_at":T}, ...]`
 ///
-/// `claimed_at` is set to `unixepoch()` on every successful claim,
-/// reclaim included, so it measures the current attempt and not the
-/// first one. `heartbeat()` deliberately leaves it alone — that is the
-/// whole reason `claim_expires_at` cannot answer "how long has this
-/// been running".
+/// One savepoint, one clock reading. `now` is read once and bound into
+/// every statement: `unixepoch()` is stable inside one statement but
+/// may tick between statements, and steps that disagree on the time
+/// would disagree on which rows they mean. In order:
+///
+/// 1. promote due `scheduled` rows to `pending`
+/// 2. move expired rows nobody holds a valid lease on to `_honker_dead`
+///    (`'expired'`)
+/// 3. move lapsed leases with no attempts left to `_honker_dead`
+///    (`'max attempts exceeded'`)
+/// 4. claim up to `n` rows: due `pending` rows and lapsed leases,
+///    ordered by `priority DESC, run_at, id`
+///
+/// Steps 1–3 each touch at most [`CLAIM_HOUSEKEEPING_LIMIT`] rows, and
+/// each reads an index that holds only rows whose deadline passed, so a
+/// claim costs the same with 1k or 50k jobs waiting. The first
+/// statement is a write, so the savepoint takes the write lock on a
+/// fresh snapshot (see [`retry`]).
+///
+/// `claimed_at` is set to `now` on every successful claim, reclaim
+/// included, so it measures the current attempt and not the first
+/// one. `heartbeat()` deliberately leaves it alone — that is the whole
+/// reason `claim_expires_at` cannot answer "how long has this been
+/// running".
 ///
 /// Here it is always a number: the UPDATE just wrote it on every row
 /// this RETURNING sees. `get_job` is the one that can report
@@ -937,9 +1029,9 @@ fn dead_letter_exhausted_claimable_inner(conn: &Connection, queue: &str) -> rusq
 ///
 /// Validity window: `claimed_at` is the start of the CURRENT claim and
 /// is only meaningful while `claim_expires_at >= unixepoch()`. When a
-/// claim lapses without a reclaim, `worker_id`, `claim_expires_at` and
-/// `claimed_at` all stay on the row and all go stale together; the
-/// next claim overwrites the three of them.
+/// claim lapses, `worker_id`, `claim_expires_at` and `claimed_at` stay
+/// on the row and go stale together until the next claim takes it,
+/// moves it to `_honker_dead`, or its holder's fenced call completes it.
 pub fn claim_batch(
     conn: &Connection,
     queue: &str,
@@ -947,49 +1039,40 @@ pub fn claim_batch(
     n: i64,
     timeout_s: i64,
 ) -> rusqlite::Result<String> {
-    // Drop reclaimable rows that already used their attempt budget so
-    // they cannot be claimed again (and so they don't clog the claim
-    // index forever). Same outer SQL statement / connection, so this
-    // shares the caller's transaction with the claim UPDATE below.
-    dead_letter_exhausted_claimable(conn, queue)?;
+    in_savepoint(conn, "honker_claim_batch", || {
+        claim_batch_inner(conn, queue, worker_id, n, timeout_s)
+    })
+}
 
-    // No SAVEPOINT around this one. It is an UPDATE, not a DELETE: a
-    // decode failure in the mapper below leaves the row in
-    // `_honker_live` with `attempts` bumped and the claim held, so the
-    // job is still there and becomes reclaimable when the visibility
-    // timeout expires. Nothing is lost, so there is nothing to undo.
-    let mut stmt = conn.prepare_cached(
-        "UPDATE _honker_live
-         SET state = 'processing',
-             worker_id = ?1,
-             claim_expires_at = unixepoch() + ?4,
-             claimed_at = unixepoch(),
-             attempts = attempts + 1
-         WHERE id IN (
-           SELECT id FROM _honker_live
-           WHERE queue = ?2
-             AND state IN ('pending', 'processing')
-             AND attempts < max_attempts
-             AND (expires_at IS NULL OR expires_at > unixepoch())
-             AND ((state = 'pending' AND run_at <= unixepoch())
-               OR (state = 'processing' AND claim_expires_at < unixepoch()))
-           ORDER BY priority DESC, run_at ASC, id ASC
-           LIMIT ?3
-         )
-         RETURNING id, queue, payload, worker_id, attempts, claim_expires_at,
-                   claimed_at",
+fn claim_batch_inner(
+    conn: &Connection,
+    queue: &str,
+    worker_id: &str,
+    n: i64,
+    timeout_s: i64,
+) -> rusqlite::Result<String> {
+    let now = now_unix(conn)?;
+    let k = CLAIM_HOUSEKEEPING_LIMIT;
+    conn.prepare_cached(PROMOTE_SQL)?
+        .execute(rusqlite::params![queue, now, k])?;
+    move_to_dead(conn, EXPIRE_IDS, queue, now, k, "expired")?;
+    move_to_dead(conn, EXHAUSTED_IDS, queue, now, k, "max attempts exceeded")?;
+
+    let mut stmt = conn.prepare_cached(CLAIM_SQL)?;
+    let rows = stmt.query_map(
+        rusqlite::params![worker_id, queue, n, timeout_s, now],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        },
     )?;
-    let rows = stmt.query_map(rusqlite::params![worker_id, queue, n, timeout_s], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, i64>(6)?,
-        ))
-    })?;
     let mut out = Vec::new();
     for row in rows {
         let (id, q, payload, w, attempts, claim_expires_at, claimed_at) = row?;
@@ -1047,38 +1130,54 @@ pub fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite
     Ok(count)
 }
 
-/// Return the earliest future deadline that could make `claim_batch()`
-/// return non-empty for this queue:
-///   * a pending row's `run_at`
-///   * one second after a processing row's `claim_expires_at`
+/// Return when `claim_batch()` could next return a job for this queue:
 ///
-/// Rows that have already exhausted `max_attempts` are ignored — they
-/// are dead-lettered on the next claim path, not reclaimable.
+///   * the current time, if a due `pending` row is claimable now
+///   * otherwise the earliest of a `scheduled` row's `run_at` and one
+///     second after a held lease's `claim_expires_at` (a reclaim needs
+///     `claim_expires_at < now`)
 ///
-/// Returns 0 if no such future deadline exists.
+/// Rows with no attempts left, and rows that expire first, are ignored:
+/// the next claim moves them to `_honker_dead` and never returns them.
+/// An expiry deadline never makes a claim return a job, so it is not a
+/// wake-up time here. A `scheduled` row whose `run_at` already passed
+/// (no claim has promoted it yet) reports the current time, never a
+/// time in the past.
+///
+/// Returns 0 if there is nothing to wait for.
 pub fn queue_next_claim_at(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
-    conn.query_row(
-        "SELECT COALESCE(MIN(deadline), 0)
-             FROM (
-               SELECT MIN(run_at) AS deadline
-               FROM _honker_live
-               WHERE queue = ?1
-                 AND state = 'pending'
-                 AND attempts < max_attempts
-                 AND (expires_at IS NULL OR expires_at > unixepoch())
-                 AND run_at > unixepoch()
-               UNION ALL
-               SELECT MIN(claim_expires_at + 1) AS deadline
-               FROM _honker_live
-               WHERE queue = ?1
-                 AND state = 'processing'
-                 AND attempts < max_attempts
-                 AND (expires_at IS NULL OR expires_at > unixepoch())
-                 AND claim_expires_at >= unixepoch()
-             )",
-        rusqlite::params![queue],
-        |r| r.get(0),
-    )
+    let now = now_unix(conn)?;
+    // Each deadline is decoded on its own, so a row with a non-integer
+    // timestamp is an error (#166), not silently skipped.
+    let (due, scheduled, lease): (bool, Option<i64>, Option<i64>) = conn.query_row(
+        "SELECT
+           EXISTS (
+             SELECT 1 FROM _honker_live
+             WHERE queue = ?1 AND state = 'pending' AND run_at <= ?2
+               AND attempts < max_attempts
+               AND (expires_at IS NULL OR expires_at > ?2)
+           ),
+           (SELECT run_at FROM _honker_live
+             WHERE queue = ?1 AND state = 'scheduled'
+               AND attempts < max_attempts
+               AND (expires_at IS NULL OR expires_at > ?2)
+             ORDER BY run_at LIMIT 1),
+           (SELECT claim_expires_at + 1 FROM _honker_live
+             WHERE queue = ?1 AND state = 'processing'
+               AND claim_expires_at >= ?2
+               AND attempts < max_attempts
+               AND (expires_at IS NULL OR expires_at > ?2)
+             ORDER BY claim_expires_at LIMIT 1)",
+        rusqlite::params![queue, now],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    if due {
+        return Ok(now);
+    }
+    Ok(match (scheduled, lease) {
+        (None, None) => 0,
+        (a, b) => a.into_iter().chain(b).min().unwrap_or(0).max(now),
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -1093,6 +1192,14 @@ pub fn queue_next_claim_at(conn: &Connection, queue: &str) -> rusqlite::Result<i
 ///   - delay set            → `unixepoch() + delay` (wins over run_at)
 ///
 /// Expiration: NULL = never; `Some(s)` = `unixepoch() + s`.
+///
+/// State: `'scheduled'` when `run_at` is in the future, else
+/// `'pending'`. A claim promotes a scheduled row once its `run_at`
+/// passes. Keeping future rows out of `'pending'` keeps them out of the
+/// ready index, so they cost a claim nothing.
+///
+/// `max_attempts` must be at least 1. A job with no attempts can never
+/// be claimed, so it is rejected here instead of sitting in the queue.
 pub fn enqueue(
     conn: &Connection,
     queue: &str,
@@ -1103,6 +1210,7 @@ pub fn enqueue(
     max_attempts: i64,
     expires: Option<i64>,
 ) -> rusqlite::Result<i64> {
+    check_max_attempts("honker_enqueue", max_attempts)?;
     let now: i64 = conn.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
     let run_at_val: i64 = match (delay, run_at) {
         (Some(d), _) => now + d,
@@ -1118,8 +1226,9 @@ pub fn enqueue(
     // table without bound on high-throughput queues.
     let id: i64 = conn.query_row(
         "INSERT INTO _honker_live
-           (queue, payload, run_at, priority, max_attempts, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+           (queue, payload, run_at, priority, max_attempts, expires_at, state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                 CASE WHEN ?3 > ?7 THEN 'scheduled' ELSE 'pending' END)
          RETURNING id",
         rusqlite::params![
             queue,
@@ -1127,7 +1236,8 @@ pub fn enqueue(
             run_at_val,
             priority,
             max_attempts,
-            expires_at
+            expires_at,
+            now
         ],
         |r| r.get(0),
     )?;
@@ -1176,8 +1286,9 @@ pub fn ack_fenced(
 }
 
 /// Retry or fail based on `attempts` vs `max_attempts`. If another
-/// attempt is allowed, flips the row back to `'pending'` with
-/// `run_at = unixepoch() + delay_s` and fires a wake. Otherwise
+/// attempt is allowed, puts the row back with `run_at = unixepoch() +
+/// delay_s`: `'scheduled'` when that is in the future (`delay_s > 0`),
+/// else `'pending'`, and fires a wake. Otherwise
 /// DELETEs from `_honker_live` and INSERTs into `_honker_dead`
 /// with `last_error=error`.
 ///
@@ -1229,7 +1340,7 @@ pub fn retry_fenced(
 // can never disagree.
 const RETRY_PENDING_SQL: [&str; 2] = [
     "UPDATE _honker_live
-     SET state = 'pending',
+     SET state = CASE WHEN ?4 > 0 THEN 'scheduled' ELSE 'pending' END,
          run_at = unixepoch() + ?4,
          worker_id = NULL,
          claim_expires_at = NULL,
@@ -1238,7 +1349,7 @@ const RETRY_PENDING_SQL: [&str; 2] = [
        AND claim_expires_at >= unixepoch()
        AND attempts < max_attempts",
     "UPDATE _honker_live
-     SET state = 'pending',
+     SET state = CASE WHEN ?4 > 0 THEN 'scheduled' ELSE 'pending' END,
          run_at = unixepoch() + ?4,
          worker_id = NULL,
          claim_expires_at = NULL,
@@ -1464,7 +1575,7 @@ fn fail_inner(
     Ok(1)
 }
 
-/// Cancel a job by id. Removes pending or processing rows from
+/// Cancel a job by id. Removes scheduled, pending or processing rows from
 /// `_honker_live` regardless of which worker (if any) holds it.
 /// Returns 1 if a row was removed, 0 otherwise. Idempotent.
 ///
@@ -1475,14 +1586,15 @@ fn fail_inner(
 /// next call — same shape as a claim that simply expired.
 pub fn cancel(conn: &Connection, job_id: i64) -> rusqlite::Result<i64> {
     let n = conn.execute(
-        "DELETE FROM _honker_live WHERE id = ?1 AND state IN ('pending', 'processing')",
+        "DELETE FROM _honker_live
+          WHERE id = ?1 AND state IN ('pending', 'scheduled', 'processing')",
         rusqlite::params![job_id],
     )?;
     Ok(n as i64)
 }
 
 /// Cancel a job by id, but only if it belongs to `queue`. Same
-/// semantics as [`cancel`] otherwise: 1 if a pending or processing row
+/// semantics as [`cancel`] otherwise: 1 if a scheduled, pending or processing row
 /// was removed, 0 otherwise, idempotent.
 ///
 /// A job in another queue is a miss, not an error — the caller gets 0,
@@ -1496,7 +1608,7 @@ pub fn cancel(conn: &Connection, job_id: i64) -> rusqlite::Result<i64> {
 pub fn cancel_in_queue(conn: &Connection, queue: &str, job_id: i64) -> rusqlite::Result<i64> {
     let n = conn.execute(
         "DELETE FROM _honker_live
-          WHERE queue = ?1 AND id = ?2 AND state IN ('pending', 'processing')",
+          WHERE queue = ?1 AND id = ?2 AND state IN ('pending', 'scheduled', 'processing')",
         rusqlite::params![queue, job_id],
     )?;
     Ok(n as i64)
@@ -1683,58 +1795,24 @@ pub fn heartbeat_fenced(
 // Task expiration
 // ---------------------------------------------------------------------
 
-/// Move expired-pending rows from `_honker_live` to `_honker_dead`
-/// with `last_error='expired'`. Returns count moved.
+/// Move expired rows from `_honker_live` to `_honker_dead` with
+/// `last_error='expired'`. Returns count moved.
 ///
-/// Runs in a SAVEPOINT for the same reason as
-/// `dead_letter_exhausted_claimable`: DELETE ... RETURNING, then decode,
-/// then INSERT. Measured before the fix: a decode failure and a failing
-/// dead-table INSERT both gave live=0, dead=0.
+/// Same rows as the expiry step of [`claim_batch`], with no row limit:
+/// `scheduled` and `pending` rows, and `processing` rows whose lease
+/// lapsed. A `processing` row with a valid lease is left for its owner.
+/// Every claim already does this for its queue, so calling it is
+/// optional; it stays for compatibility and for queues nobody claims.
+///
+/// Runs in a SAVEPOINT for the same reason as the claim's moves: DELETE
+/// ... RETURNING, then decode, then INSERT. Measured before the
+/// savepoint: a decode failure and a failing dead-table INSERT both
+/// gave live=0, dead=0.
 pub fn sweep_expired(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
     in_savepoint(conn, "honker_sweep_expired", || {
-        sweep_expired_inner(conn, queue)
+        let now = now_unix(conn)?;
+        move_to_dead(conn, EXPIRE_IDS, queue, now, -1, "expired")
     })
-}
-
-fn sweep_expired_inner(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
-    let mut select = conn.prepare_cached(
-        "DELETE FROM _honker_live
-         WHERE queue = ?1
-           AND state = 'pending'
-           AND expires_at IS NOT NULL
-           AND expires_at <= unixepoch()
-         RETURNING id, queue, payload, priority, run_at, max_attempts,
-                   attempts, created_at",
-    )?;
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(i64, String, String, i64, i64, i64, i64, i64)> = select
-        .query_map(rusqlite::params![queue], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    if rows.is_empty() {
-        return Ok(0);
-    }
-    let mut insert = conn.prepare_cached(
-        "INSERT INTO _honker_dead
-           (id, queue, payload, priority, run_at, max_attempts,
-            attempts, last_error, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'expired', ?8)",
-    )?;
-    let count = rows.len() as i64;
-    for r in rows {
-        insert.execute(rusqlite::params![r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7])?;
-    }
-    Ok(count)
 }
 
 // ---------------------------------------------------------------------
@@ -1843,7 +1921,8 @@ pub fn rate_limit_sweep(conn: &Connection, older_than_s: i64) -> rusqlite::Resul
 /// computed as the next cron boundary strictly after
 /// `unixepoch()`. Calling twice with the same name replaces the
 /// first registration entirely. `max_attempts` is stored on the task
-/// row and applied to every job `scheduler_tick` enqueues for it.
+/// row and applied to every job `scheduler_tick` enqueues for it. It
+/// must be at least 1 (an error otherwise; it used to be clamped to 1).
 pub fn scheduler_register(
     conn: &Connection,
     name: &str,
@@ -1854,7 +1933,7 @@ pub fn scheduler_register(
     expires_s: Option<i64>,
     max_attempts: i64,
 ) -> rusqlite::Result<i64> {
-    let max_attempts = if max_attempts < 1 { 1 } else { max_attempts };
+    check_max_attempts("honker_scheduler_register", max_attempts)?;
     let now = now_unix(conn)?;
     let next_fire_at = super::cron::next_after_unix(cron_expr, now).map_err(to_sql_err)?;
     conn.execute(
@@ -2109,7 +2188,9 @@ pub fn scheduler_list(conn: &Connection) -> rusqlite::Result<String> {
 /// Mutate one or more fields of a registered schedule. Pass `None` for
 /// fields that should be left unchanged. If `cron_expr` is provided,
 /// `next_fire_at` is recomputed from `unixepoch()`. Returns 1 if the
-/// row was updated, 0 if it doesn't exist.
+/// row was updated, 0 if it doesn't exist. A new `max_attempts` below
+/// 1 is an error (it used to be clamped to 1); `Some(None)` resets it
+/// to 3.
 #[allow(clippy::too_many_arguments)]
 pub fn scheduler_update(
     conn: &Connection,
@@ -2120,6 +2201,9 @@ pub fn scheduler_update(
     expires_s: Option<Option<i64>>,
     max_attempts: Option<Option<i64>>,
 ) -> rusqlite::Result<i64> {
+    if let Some(Some(m)) = max_attempts {
+        check_max_attempts("honker_scheduler_update", m)?;
+    }
     // Verify exists first so we can return 0 cleanly without dynamic SQL gymnastics.
     let exists: bool = conn
         .query_row(
@@ -2172,7 +2256,6 @@ pub fn scheduler_update(
         }
         if let Some(m) = max_attempts {
             let m = m.unwrap_or(3);
-            let m = if m < 1 { 1 } else { m };
             conn.execute(
                 "UPDATE _honker_scheduler_tasks SET max_attempts = ?2 WHERE name = ?1",
                 rusqlite::params![name, m],
@@ -2352,6 +2435,18 @@ pub fn stream_get_offset(conn: &Connection, consumer: &str, topic: &str) -> rusq
 
 fn now_unix(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("SELECT unixepoch()", [], |r| r.get(0))
+}
+
+/// Reject an attempt budget below 1. Such a job could never be
+/// claimed: claim needs `attempts < max_attempts`, and `attempts` starts
+/// at 0. `func` is the public SQL function, named in the error.
+fn check_max_attempts(func: &str, max_attempts: i64) -> rusqlite::Result<()> {
+    if max_attempts < 1 {
+        return Err(to_sql_err(format!(
+            "{func}: max_attempts must be at least 1, got {max_attempts}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2711,6 +2806,12 @@ mod optional_error_tests {
     //   claim_batch -> dead_letter_exhausted_claimable  live=0, dead=0
     //   retry()'s dead-letter branch                    live=0, dead=0
     //   sweep_expired                                   live=0, dead=0
+    //
+    // claim_batch and sweep_expired now move rows with a set INSERT ...
+    // SELECT and a DELETE (`move_to_dead`): nothing is decoded in Rust,
+    // so a corrupt column moves with the row. What can still go wrong
+    // is the dead INSERT failing, or the two statements disagreeing on
+    // the rows; both must roll back.
 
     /// Make every INSERT into `_honker_dead` fail. Stands in for a
     /// constraint violation or an I/O error on the second half of a
@@ -2738,9 +2839,37 @@ mod optional_error_tests {
         id
     }
 
-    /// A due job that has already used its whole attempt budget, so an
-    /// ordinary claim dead-letters it.
-    fn exhausted_pending_job(conn: &Connection) -> i64 {
+    /// Turn a job into a claim whose holder vanished: `processing`, with
+    /// a lease that lapsed 10 s ago.
+    fn lapse(conn: &Connection, id: i64) {
+        conn.execute(
+            "UPDATE _honker_live SET state = 'processing', worker_id = 'gone',
+                    claim_expires_at = unixepoch() - 10
+              WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    }
+
+    /// Make the INSERT and the DELETE of a dead-letter move disagree:
+    /// once a row is copied to `_honker_dead`, the live row stops
+    /// matching (its lease looks valid and it no longer expires), so
+    /// the DELETE misses it.
+    fn make_copy_and_delete_disagree(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TRIGGER test_disagree AFTER INSERT ON _honker_dead
+             BEGIN
+               UPDATE _honker_live
+                  SET claim_expires_at = unixepoch() + 100, expires_at = NULL
+                WHERE id = NEW.id;
+             END",
+        )
+        .unwrap();
+    }
+
+    /// A lapsed claim that has already used its whole attempt budget,
+    /// so an ordinary claim dead-letters it.
+    fn exhausted_lapsed_job(conn: &Connection) -> i64 {
         let id: i64 = conn
             .query_row(
                 "SELECT honker_enqueue('emails', '{}', NULL, NULL, 0, 1, NULL)",
@@ -2750,51 +2879,53 @@ mod optional_error_tests {
             .unwrap();
         conn.execute("UPDATE _honker_live SET attempts = 1 WHERE id = ?1", [id])
             .unwrap();
+        lapse(conn, id);
         id
     }
 
     // The hot path: no fail() call involved, an ordinary claim triggers
-    // it. Before the savepoint this returned the decode error with the
-    // job gone from both tables.
+    // it. A corrupt column no longer stops the move: the row lands in
+    // _honker_dead whole and leaves _honker_live, nothing in between.
     #[test]
-    fn claim_batch_rolls_back_a_dead_letter_decode_failure() {
+    fn claim_batch_moves_a_corrupt_row_whole() {
         let conn = db();
         let id = undecodable_pending_job(&conn);
-        let err = claim_batch(&conn, "emails", "w1", 8, 300)
-            .expect_err("a non-integer attempts column must reach the caller");
-        assert!(
-            err.to_string().contains("attempts"),
-            "expected the error to name the bad column, got: {err}"
-        );
-        assert_eq!(
-            live_count(&conn, id),
-            1,
-            "the dead-letter DELETE must roll back: the job has to stay in \
-             _honker_live, not vanish from both tables"
-        );
-        assert_eq!(dead_count(&conn, id), 0, "and it must not be half-moved");
+        lapse(&conn, id);
+        assert_eq!(claim_batch(&conn, "emails", "w1", 8, 300).unwrap(), "[]");
+        assert_eq!(live_count(&conn, id), 0);
+        let attempts: String = conn
+            .query_row(
+                "SELECT attempts FROM _honker_dead WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, "not-a-number", "copied as is");
     }
 
-    // The DELETE takes the whole matching set before anything is
-    // decoded, so one bad row used to lose every job beside it.
+    // If the copy and the delete ever select different rows, the move
+    // must roll back instead of losing or duplicating a job.
     #[test]
-    fn claim_batch_dead_letter_keeps_the_whole_batch() {
+    fn claim_batch_rolls_back_when_copy_and_delete_disagree() {
         let conn = db();
-        let bad = undecodable_pending_job(&conn);
-        let neighbour = undecodable_pending_job(&conn);
-        let _ = claim_batch(&conn, "emails", "w1", 8, 300)
-            .expect_err("a non-integer attempts column must reach the caller");
-        assert_eq!(
-            (live_count(&conn, bad), live_count(&conn, neighbour)),
-            (1, 1),
-            "one undecodable row must not take the rest of the batch with it"
+        let a = exhausted_lapsed_job(&conn);
+        let b = exhausted_lapsed_job(&conn);
+        make_copy_and_delete_disagree(&conn);
+        let err = claim_batch(&conn, "emails", "w1", 8, 300)
+            .expect_err("a copy/delete mismatch must reach the caller");
+        assert!(
+            err.to_string().contains("copied 2 but deleted 0"),
+            "got: {err}"
         );
+        assert_eq!((live_count(&conn, a), live_count(&conn, b)), (1, 1));
+        assert_eq!((dead_count(&conn, a), dead_count(&conn, b)), (0, 0));
+        assert!(conn.is_autocommit());
     }
 
     #[test]
     fn claim_batch_rolls_back_when_the_dead_insert_fails() {
         let conn = db();
-        let id = exhausted_pending_job(&conn);
+        let id = exhausted_lapsed_job(&conn);
         block_dead_inserts(&conn);
         let err = claim_batch(&conn, "emails", "w1", 8, 300)
             .expect_err("a failing _honker_dead INSERT must reach the caller");
@@ -2815,7 +2946,7 @@ mod optional_error_tests {
     #[test]
     fn claim_batch_still_dead_letters_and_claims_normally() {
         let conn = db();
-        let exhausted = exhausted_pending_job(&conn);
+        let exhausted = exhausted_lapsed_job(&conn);
         let fresh: i64 = conn
             .query_row(
                 "SELECT honker_enqueue('emails', '{}', NULL, NULL, 0, 3, NULL)",
@@ -2888,9 +3019,9 @@ mod optional_error_tests {
         assert_eq!(dead_count(&conn, id), 1);
     }
 
-    // sweep_expired: same DELETE ... RETURNING then decode then INSERT.
+    // sweep_expired: the same set move as the claim's expiry step.
     #[test]
-    fn sweep_expired_rolls_back_a_decode_failure() {
+    fn sweep_expired_rolls_back_when_copy_and_delete_disagree() {
         let conn = db();
         let id = undecodable_pending_job(&conn);
         conn.execute(
@@ -2898,16 +3029,16 @@ mod optional_error_tests {
             [id],
         )
         .unwrap();
-        let err = sweep_expired(&conn, "emails")
-            .expect_err("a non-integer attempts column must reach the caller");
+        make_copy_and_delete_disagree(&conn);
+        let err = sweep_expired(&conn, "emails").expect_err("a mismatch must reach the caller");
         assert!(
-            err.to_string().contains("attempts"),
-            "expected the error to name the bad column, got: {err}"
+            err.to_string().contains("copied 1 but deleted 0"),
+            "got: {err}"
         );
         assert_eq!(
             live_count(&conn, id),
             1,
-            "the sweep's DELETE must roll back, not lose the job"
+            "the move must roll back, not lose the job"
         );
         assert_eq!(dead_count(&conn, id), 0);
     }
@@ -3014,24 +3145,25 @@ mod optional_error_tests {
     }
 
     #[test]
-    fn sql_honker_claim_batch_rolls_back_the_dead_letter_sweep() {
+    fn sql_honker_claim_batch_rolls_back_the_dead_letter_move() {
         let conn = db();
-        let id = undecodable_pending_job(&conn);
+        let id = exhausted_lapsed_job(&conn);
+        make_copy_and_delete_disagree(&conn);
         let err = conn
             .query_row(
                 "SELECT honker_claim_batch('emails', 'w1', 8, 300)",
                 [],
                 |r| r.get::<_, String>(0),
             )
-            .expect_err("the decode error must surface through the SQL function too");
+            .expect_err("the mismatch must surface through the SQL function too");
         assert!(
-            err.to_string().contains("attempts"),
-            "expected the error to name the bad column, got: {err}"
+            err.to_string().contains("copied 1 but deleted 0"),
+            "got: {err}"
         );
         assert_eq!(
             live_count(&conn, id),
             1,
-            "the dead-letter sweep must roll back on the binding path too"
+            "the dead-letter move must roll back on the binding path too"
         );
         assert_eq!(dead_count(&conn, id), 0);
         assert!(conn.is_autocommit());
@@ -3046,12 +3178,16 @@ mod optional_error_tests {
             [id],
         )
         .unwrap();
+        block_dead_inserts(&conn);
         let err = conn
             .query_row("SELECT honker_sweep_expired('emails')", [], |r| {
                 r.get::<_, i64>(0)
             })
-            .expect_err("the decode error must surface through the SQL function too");
-        assert!(err.to_string().contains("attempts"), "got: {err}");
+            .expect_err("the insert failure must surface through the SQL function too");
+        assert!(
+            err.to_string().contains("dead insert blocked"),
+            "got: {err}"
+        );
         assert_eq!(live_count(&conn, id), 1);
         assert_eq!(dead_count(&conn, id), 0);
         assert!(conn.is_autocommit());
