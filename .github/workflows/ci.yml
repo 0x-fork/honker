@@ -231,7 +231,7 @@ jobs:
 
   python:
     name: python · honker
-    timeout-minutes: 10
+    timeout-minutes: 13
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -285,6 +285,19 @@ jobs:
             . .venv/bin/activate
           fi
           python -m pytest tests/ -q -n 0 --tb=short
+      # Multi-process lifecycle torture test against the raw loadable
+      # extension (tests/test_lifecycle_torture.py). It is marked `slow`
+      # so the run above deselects it; it runs here on its own, without
+      # xdist. It needs a sqlite3 that can load extensions, which macOS
+      # setup-python lacks, so it runs on uv's managed CPython. It fails,
+      # never skips, when the extension cannot be loaded. Windows has no
+      # SIGKILL, so it is not run there.
+      - name: Lifecycle torture test (raw extension, multi-process)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          uv run --no-project --managed-python --python "${{ matrix.python-version }}" --with pytest \
+            python -m pytest tests/test_lifecycle_torture.py -o addopts="" -q -rsxX --tb=short
       - name: Prove the documented Python ORM recipes
         shell: bash
         run: |
